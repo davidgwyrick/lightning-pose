@@ -51,9 +51,22 @@ def _build_video_loader_cls(cfg: DictConfig | dict, model_type: str, is_multivie
     except (AttributeError, KeyError):
         backend = 'dali'
 
-    if backend == 'nvcodec' and model_type == 'base' and not is_multiview:
-        from lightning_pose.data.nvcodec import PrepareNvCodec
-        return PrepareNvCodec
+    if backend == 'nvcodec':
+        if model_type == 'base' and not is_multiview:
+            from lightning_pose.data.nvcodec import PrepareNvCodec
+            print(
+                f'[lightning-pose] video backend = nvcodec (PyNvVideoCodec / NVDEC); '
+                f'model_type={model_type}, is_multiview={is_multiview}',
+                flush=True,
+            )
+            return PrepareNvCodec
+        print(
+            f'[lightning-pose] video backend requested = nvcodec but unsupported '
+            f'(model_type={model_type}, is_multiview={is_multiview}); falling back to DALI.',
+            flush=True,
+        )
+    else:
+        print(f'[lightning-pose] video backend = dali', flush=True)
     return PrepareDALI
 
 # to ignore imports for sphix-autoapidoc
