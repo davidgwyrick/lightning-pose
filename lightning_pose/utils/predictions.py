@@ -29,6 +29,33 @@ from lightning_pose.models import ALLOWED_MODELS
 if TYPE_CHECKING:
     from lightning_pose.api.model import Model
 
+
+def _build_video_loader_cls(cfg: DictConfig | dict, model_type: str, is_multiview: bool):
+    """Return the video-loader class to use, based on `cfg.dali.backend`.
+
+    Defaults to DALI. Selecting `nvcodec` requires PyNvVideoCodec and is currently
+    limited to single-video, single-view, base (non-context) inference; falls back
+    to DALI for unsupported configurations.
+
+    Args:
+        cfg: full hydra config (must contain `dali` subtree)
+        model_type: "base" or "context"
+        is_multiview: whether this is a multi-view inference call
+
+    Returns:
+        class with the same `__call__` interface as `PrepareDALI`
+    """
+    backend = 'dali'
+    try:
+        backend = str(cfg.dali.get('backend', 'dali')).lower()
+    except (AttributeError, KeyError):
+        backend = 'dali'
+
+    if backend == 'nvcodec' and model_type == 'base' and not is_multiview:
+        from lightning_pose.data.nvcodec import PrepareNvCodec
+        return PrepareNvCodec
+    return PrepareDALI
+
 # to ignore imports for sphix-autoapidoc
 __all__ = [
     "PredictionHandler",
@@ -428,7 +455,8 @@ def predict_single_video(
     # initialize
     model_type = "context" if cfg.model.model_type == "heatmap_mhcrnn" else "base"
     cfg.training.imgaug = "default"
-    vid_pred_class = PrepareDALI(
+    loader_cls = _build_video_loader_cls(cfg=cfg, model_type=model_type, is_multiview=False)
+    vid_pred_class = loader_cls(
         train_stage="predict",
         model_type=model_type,
         dali_config=cfg.dali,
@@ -908,7 +936,10 @@ def predict_video(
     )
 
     filenames = [video_file] if not is_multiview else [[f] for f in video_file]
-    vid_pred_class = PrepareDALI(
+    loader_cls = _build_video_loader_cls(
+        cfg=model.config.cfg, model_type=model_type, is_multiview=is_multiview,
+    )
+    vid_pred_class = loader_cls(
         train_stage="predict",
         model_type=model_type,
         dali_config=model.config.cfg.dali,
