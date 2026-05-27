@@ -6,15 +6,15 @@ import argparse
 import textwrap
 from pathlib import Path
 from pprint import pprint
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .. import types
 
 if TYPE_CHECKING:
-    from lightning_pose.api.model import Model
+    from lightning_pose.api import Model
 
 
-def register_parser(subparsers):
+def register_parser(subparsers: Any) -> argparse.ArgumentParser:
     """Register the predict command parser."""
     predict_parser = subparsers.add_parser(
         "predict",
@@ -23,7 +23,7 @@ def register_parser(subparsers):
         Predicts keypoints on videos or images.
 
           Video predictions are saved to::
-          
+
             <model_dir>/
             └── video_preds/
                 ├── <video_filename>.csv              (predictions)
@@ -32,7 +32,7 @@ def register_parser(subparsers):
                     └── <video_filename>_labeled.mp4
 
           Image predictions are saved to::
-          
+
             <model_dir>/
             └── image_preds/
                 └── <image_dirname | csv_filename | timestamp>/
@@ -54,10 +54,10 @@ def register_parser(subparsers):
         help=textwrap.dedent(
             """\
             one or more  video files, image files, CSV files, or directories to run prediction on
-            
+
             * directories: iterates over videos or images in the directory
-            * CSV file: must be formatted as a label file. predicts on the frames and computes pixel error
-                    against keypoint labels
+            * CSV file: must be formatted as a label file. predicts on the frames and computes
+                pixel error against keypoint labels
             """
         ),
     )
@@ -91,19 +91,17 @@ def register_parser(subparsers):
     return predict_parser
 
 
-def get_parser():
+def get_parser() -> argparse.ArgumentParser:
     """Return an ArgumentParser for the `litpose predict` subcommand (for docs)."""
-    import argparse
-
     parser = argparse.ArgumentParser(prog="litpose")
     subparsers = parser.add_subparsers(dest="command")
     return register_parser(subparsers)
 
 
-def handle(args):
+def handle(args: argparse.Namespace) -> None:
     """Handle the predict command."""
     # Delay this import because it's slow.
-    from lightning_pose.api.model import Model
+    from lightning_pose.api import Model
 
     model = Model.from_dir2(args.model_dir, hydra_overrides=args.overrides)
     input_paths = [Path(p) for p in args.input_path]
@@ -125,7 +123,16 @@ def _predict_multi_type(
     skip_viz: bool,
     skip_existing: bool,
     progress_file: Path | None = None,
-):
+) -> None:
+    """Run prediction on a single path, dispatching to video, CSV, or directory handling.
+
+    Args:
+        model: the model to run prediction with.
+        path: input file or directory to predict on.
+        skip_viz: if True, skip generating labeled visualization outputs.
+        skip_existing: if True, skip predictions for which an output CSV already exists.
+        progress_file: optional path to write prediction progress as JSON.
+    """
     if path.is_dir():
         image_files = [p for p in path.iterdir() if p.is_file() and p.suffix in [".png", ".jpg"]]
         video_files = [p for p in path.iterdir() if p.is_file() and p.suffix == ".mp4"]
@@ -171,7 +178,16 @@ def _predict_multi_type_multi_view(
     skip_viz: bool,
     skip_existing: bool,
     progress_file: Path | None = None,
-):
+) -> None:
+    """Run multi-view prediction on a list of paths (videos or directories).
+
+    Args:
+        model: the multi-view model to run prediction with.
+        paths: list of input video files or directories to predict on.
+        skip_viz: if True, skip generating labeled visualization outputs.
+        skip_existing: if True, skip sessions for which output CSVs already exist.
+        progress_file: optional path to write prediction progress as JSON.
+    """
     # delay this import because it's slow
     from lightning_pose.utils.io import (
         extract_session_name_from_video,
@@ -224,5 +240,6 @@ def _predict_multi_type_multi_view(
                 print(f"Skipping {path}: no videos found.")
     else:
         raise NotImplementedError(
-            "For multi view model predictions, either pass in multiple video views to be predicted, or a directory containing videos"
+            "For multi view model predictions, either pass in multiple video views to be "
+            "predicted, or a directory containing videos"
         )

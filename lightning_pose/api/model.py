@@ -1,37 +1,228 @@
+"""High-level Model class for loading trained checkpoints and running inference."""
+
 from __future__ import annotations
 
 import copy
 from pathlib import Path
+from typing import Any, cast
 
 import cv2
 import numpy as np
 import pandas as pd
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from lightning_pose.api.model_config import ModelConfig
-from lightning_pose.data import _IMAGENET_MEAN, _IMAGENET_STD
-from lightning_pose.data.datatypes import MultiviewPredictionResult, PredictionResult
-from lightning_pose.data.utils import convert_bbox_coords
-from lightning_pose.models import ALLOWED_MODELS
-from lightning_pose.utils import io as io_utils
-from lightning_pose.utils.predictions import generate_labeled_video as generate_labeled_video_fn
-from lightning_pose.utils.predictions import (
-    load_model_from_checkpoint,
-    predict_dataset,
-    predict_video,
-)
-from lightning_pose.utils.scripts import (
-    compute_metrics_single,
+from lightning_pose.data import (
+    _IMAGENET_MEAN,
+    _IMAGENET_STD,
     get_data_module,
     get_dataset,
     get_imgaug_transform,
 )
+from lightning_pose.data.datamodules import BaseDataModule, UnlabeledDataModule
+from lightning_pose.data.datatypes import MultiviewPredictionResult, PredictionResult
+from lightning_pose.data.utils import convert_bbox_coords
+from lightning_pose.metrics import compute_metrics_single
+from lightning_pose.models import ALLOWED_MODEL_TYPES, ALLOWED_MODELS
+from lightning_pose.utils import io as io_utils
+from lightning_pose.utils.predictions import generate_labeled_video as generate_labeled_video_fn
+from lightning_pose.utils.predictions import (
+    predict_dataset,
+    predict_video,
+)
 
-__all__ = ["Model"]
+__all__ = ["Model", "get_model_class", "load_model_from_checkpoint"]
+
+
+def get_model_class(map_type: ALLOWED_MODEL_TYPES, semi_supervised: bool) -> type[ALLOWED_MODELS]:
+    """Return the model class for the given model type and supervision mode.
+
+    Args:
+        map_type: one of ``"regression"``, ``"heatmap"``, ``"heatmap_mhcrnn"``,
+            ``"heatmap_multiview_transformer"``.
+        semi_supervised: True to return the semi-supervised variant.
+
+    Returns:
+        model class (not an instance).
+
+    Raises:
+        NotImplementedError: if ``map_type`` is not recognised.
+
+    """
+    if not semi_supervised:
+        if map_type == 'regression':
+            from lightning_pose.models import RegressionTracker as ModelClass
+        elif map_type == 'heatmap':
+            from lightning_pose.models import HeatmapTracker as ModelClass
+        elif map_type == 'heatmap_mhcrnn':
+            from lightning_pose.models import HeatmapTrackerMHCRNN as ModelClass
+        elif map_type == 'heatmap_multiview_transformer':
+            from lightning_pose.models import HeatmapTrackerMultiviewTransformer as ModelClass
+        else:
+            raise NotImplementedError(
+                f'{map_type} is an invalid model_type for a fully supervised model'
+            )
+    else:
+        if map_type == 'regression':
+            from lightning_pose.models import SemiSupervisedRegressionTracker as ModelClass
+        elif map_type == 'heatmap':
+            from lightning_pose.models import SemiSupervisedHeatmapTracker as ModelClass
+        elif map_type == 'heatmap_mhcrnn':
+            from lightning_pose.models import SemiSupervisedHeatmapTrackerMHCRNN as ModelClass
+        elif map_type == 'heatmap_multiview_transformer':
+            from lightning_pose.models import (
+                SemiSupervisedHeatmapTrackerMultiviewTransformer as ModelClass,
+            )
+        else:
+            raise NotImplementedError(
+                f'{map_type} is an invalid model_type for a semi-supervised model'
+            )
+    return ModelClass
+
+
+def load_model_from_checkpoint(
+    cfg: DictConfig | ListConfig,
+    ckpt_file: str | None,
+    eval: bool = False,
+    data_module: BaseDataModule | UnlabeledDataModule | None = None,
+    skip_data_module: bool = False,
+) -> ALLOWED_MODELS:
+    """Load a Lightning Pose model from a checkpoint file.
+
+    Args:
+        cfg: model config
+        ckpt_file: absolute path to model checkpoint
+        eval: True for eval mode, False for train mode
+        data_module: used to initialise unsupervised losses
+        skip_data_module: if ``data_module`` is not None this is ignored.
+            If False and ``data_module=None``, a data module is created from the config file and
+            unsupervised losses are accessible in the model.
+            If True and ``data_module=None``, the unsupervised losses are not accessible in the
+            model; recommended for running inference on new videos.
+
+    Returns:
+        model as a Lightning Module
+
+    Raises:
+        ValueError: if ``ckpt_file`` is None
+
+    """
+    if ckpt_file is None:
+        raise ValueError('ckpt_file must be provided to load a model from checkpoint')
+    from lightning_pose.data import (
+        get_data_module,
+        get_dataset,
+        get_imgaug_transform,
+    )
+    from lightning_pose.losses import get_loss_factories
+    from lightning_pose.models import check_if_semi_supervised
+    from lightning_pose.utils.io import return_absolute_data_paths
+
+    delete_extras = False
+    if not data_module and not skip_data_module:
+        delete_extras = True
+        data_dir, video_dir = return_absolute_data_paths(data_cfg=cfg.data)
+        imgaug_transform = get_imgaug_transform(cfg=cfg)
+        dataset = get_dataset(cfg=cfg, data_dir=data_dir, imgaug_transform=imgaug_transform)
+        data_module = get_data_module(cfg=cfg, dataset=dataset, video_dir=video_dir)
+    if not data_module:
+        loss_factories = {'supervised': None, 'unsupervised': None}
+    else:
+        loss_factories = get_loss_factories(cfg=cfg, data_module=data_module)
+
+    semi_supervised = check_if_semi_supervised(cfg.model.losses_to_use)
+    ModelClass = get_model_class(
+        map_type=cfg.model.model_type,
+        semi_supervised=semi_supervised,
+    )
+
+    try:
+        checkpoint = torch.load(ckpt_file)
+    except Exception as e:
+        print(f'Warning: Failed to load checkpoint with default settings: {e}')
+        print('Attempting to load with weights_only=False...')
+        checkpoint = torch.load(ckpt_file, weights_only=False)
+    state_dict = checkpoint.get('state_dict', checkpoint)
+
+    # fix state dict key mismatch for upsampling layers in old checkpoints
+    keys_remapped = False
+    for key in list(state_dict.keys()):
+        if key.startswith('upsampling_layers.'):
+            state_dict['head.' + key] = state_dict.pop(key)
+            keys_remapped = True
+
+    if keys_remapped:
+        checkpoint['state_dict'] = state_dict
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.ckpt', delete=False) as tmp_file:
+            torch.save(checkpoint, tmp_file.name)
+            fixed_ckpt_file = tmp_file.name
+    else:
+        fixed_ckpt_file = ckpt_file
+
+    if semi_supervised:
+        model = ModelClass.load_from_checkpoint(
+            fixed_ckpt_file,
+            loss_factory=loss_factories['supervised'],
+            loss_factory_unsupervised=loss_factories['unsupervised'],
+            strict=False,
+        )
+    else:
+        model = ModelClass.load_from_checkpoint(
+            fixed_ckpt_file,
+            loss_factory=loss_factories['supervised'],
+            strict=False,
+        )
+
+    if keys_remapped:
+        import os
+        os.unlink(fixed_ckpt_file)
+
+    if eval:
+        model.eval()
+
+    if delete_extras:
+        del imgaug_transform
+        del dataset
+        del data_module
+    del loss_factories
+    torch.cuda.empty_cache()
+
+    return model
 
 
 class Model:
+    """High-level interface for inference with a trained lightning-pose model.
+
+    Load a saved model with `Model.from_dir`, then call prediction methods directly.
+    Model weights are loaded lazily on the first prediction call.
+
+    Attributes:
+        model_dir: absolute path to the directory the model is stored in.
+        config: the model configuration as a `ModelConfig` object.
+        model: the underlying PyTorch model; None until the first prediction call.
+
+    Examples:
+        >>> from lightning_pose.api import Model
+        >>> model = Model.from_dir("outputs/2024-01-01/12-00-00")
+
+        Single-frame inference (no file I/O):
+        >>> import numpy as np
+        >>> frame = np.zeros((256, 256, 3), dtype=np.uint8)
+        >>> result = model.predict_frame(frame)
+        >>> result["keypoints"].shape   # (num_keypoints, 2)
+        >>> result["confidence"].shape  # (num_keypoints,)
+
+        Predict on a video file:
+        >>> pred_result = model.predict_on_video_file("path/to/video.mp4")
+        >>> pred_result.predictions     # pd.DataFrame with MultiIndex columns
+        >>> pred_result.metrics         # ComputeMetricsSingleResult or None
+
+        Predict on a labeled CSV (also computes pixel error):
+        >>> pred_result = model.predict_on_label_csv("path/to/CollectedData.csv")
+    """
+
     model_dir: Path
     """Directory the model is stored in."""
 
@@ -48,12 +239,27 @@ class Model:
     UNSPECIFIED = "unspecified"
 
     @staticmethod
-    def from_dir(model_dir: str | Path):
-        """Create a `Model` instance for a model stored at `model_dir`."""
+    def from_dir(model_dir: str | Path) -> Model:
+        """Create a `Model` instance for a model stored at `model_dir`.
+
+        Args:
+            model_dir: path to a model output directory containing ``config.yaml``
+                and a ``.ckpt`` checkpoint file.
+
+        Returns:
+            Model ready for inference. Weights are loaded lazily on the first
+            prediction call.
+
+        Examples:
+            >>> from lightning_pose.api import Model
+            >>> model = Model.from_dir("outputs/2024-01-01/12-00-00")
+            >>> model.config.is_multi_view()
+            False
+        """
         return Model.from_dir2(model_dir)
 
     @staticmethod
-    def from_dir2(model_dir: str | Path, hydra_overrides: list[str] = None):
+    def from_dir2(model_dir: str | Path, hydra_overrides: list[str] | None = None) -> Model:
         """Internal version of from_dir that supports hydra_overrides. Not sure whether to
         promote this to public API yet."""
 
@@ -72,16 +278,30 @@ class Model:
 
         return Model(model_dir, config)
 
-    def __init__(self, model_dir: str | Path, config: ModelConfig):
+    def __init__(self, model_dir: str | Path, config: ModelConfig) -> None:
+        """Initialize a Model from a directory and a pre-loaded config.
+
+        Prefer `Model.from_dir` for typical usage. Use this constructor when you
+        have already constructed a `ModelConfig` (e.g. after applying Hydra overrides).
+
+        Args:
+            model_dir: path to the model output directory.
+            config: the model configuration.
+        """
         self.model_dir = Path(model_dir).absolute()
         self.config = config
 
     @property
-    def cfg(self) -> DictConfig:
+    def cfg(self) -> DictConfig | ListConfig:
         """The model configuration as an `omegaconf.DictConfig`."""
         return self.config.cfg
 
-    def _load(self):
+    def _load(self) -> None:
+        """Load model weights from the checkpoint file on first call; no-op thereafter.
+
+        Raises:
+            FileNotFoundError: if no checkpoint file is found in `model_dir`.
+        """
         if self.model is None:
             ckpt_file = io_utils.ckpt_path_from_base_path(
                 base_path=str(self.model_dir), model_name=self.cfg.model.model_name
@@ -98,21 +318,34 @@ class Model:
             )
 
     def image_preds_dir(self) -> Path:
+        """Return the directory where image/CSV predictions are saved."""
         return self.model_dir / "image_preds"
 
     def video_preds_dir(self) -> Path:
+        """Return the directory where video predictions are saved."""
         return self.model_dir / "video_preds"
 
     def labeled_videos_dir(self) -> Path:
+        """Return the directory where prediction-annotated videos are saved."""
         return self.model_dir / "video_preds" / "labeled_videos"
 
-    def cropped_data_dir(self):
+    def cropped_data_dir(self) -> Path:
+        """Return the directory where cropzoom-cropped images are saved."""
         return self.model_dir / "cropped_images"
 
-    def cropped_videos_dir(self):
+    def cropped_videos_dir(self) -> Path:
+        """Return the directory where cropzoom-cropped videos are saved."""
         return self.model_dir / "cropped_videos"
 
-    def cropped_csv_file_path(self, csv_file_path: str | Path):
+    def cropped_csv_file_path(self, csv_file_path: str | Path) -> Path:
+        """Return the path where a cropzoom-adjusted CSV file will be saved.
+
+        Args:
+            csv_file_path: path to the original labeled CSV file.
+
+        Returns:
+            path of the form ``{model_dir}/image_preds/{csv_name}/cropped_{csv_name}``.
+        """
         csv_file_path = Path(csv_file_path)
         return (
             self.model_dir
@@ -161,8 +394,20 @@ class Model:
                 dimensions, bbox produces an empty crop, or a context model
                 receives single-frame input.
 
+        Examples:
+            >>> import numpy as np
+            >>> frame = np.zeros((256, 256, 3), dtype=np.uint8)
+            >>> result = model.predict_frame(frame)
+            >>> result["keypoints"].shape    # (num_keypoints, 2)
+            >>> result["confidence"].shape   # (num_keypoints,)
+
+            With a bounding-box crop (x, y, width, height):
+            >>> result = model.predict_frame(frame, bbox=(100, 50, 128, 128))
+
         """
         self._load()
+        if self.model is None:
+            raise RuntimeError('model failed to load; self.model is None after _load()')
 
         # --- Input validation ---
         if frame_rgb.dtype != np.uint8:
@@ -234,7 +479,8 @@ class Model:
         mean = np.array(_IMAGENET_MEAN, dtype=np.float32)
         std = np.array(_IMAGENET_STD, dtype=np.float32)
 
-        def _preprocess_single(img):
+        def _preprocess_single(img: np.ndarray) -> np.ndarray:
+            """Resize, normalize, and transpose a single HWC uint8 frame to CHW float32."""
             resized = cv2.resize(
                 img, (resize_w, resize_h), interpolation=cv2.INTER_LINEAR,
             )
@@ -280,7 +526,7 @@ class Model:
         # --- Inference via get_loss_inputs_labeled ---
         self.model.eval()
         with torch.inference_mode():
-            result = self.model.get_loss_inputs_labeled(batch_dict)
+            result = self.model.get_loss_inputs_labeled(batch_dict)  # type: ignore[arg-type]
 
         # --- Extract predictions ---
         kp_pred = result["keypoints_pred"]
@@ -308,7 +554,7 @@ class Model:
         else:
             # Regression model — get_loss_inputs_labeled does not call
             # convert_bbox_coords, so we apply the remap ourselves.
-            kp_pred = convert_bbox_coords(batch_dict, kp_pred, in_place=False)
+            kp_pred = convert_bbox_coords(batch_dict, kp_pred, in_place=False)  # type: ignore[arg-type]
             kp = kp_pred[0].cpu().numpy().reshape(-1, 2).astype(np.float32)
             conf = np.ones(num_kp, dtype=np.float32)
 
@@ -338,6 +584,17 @@ class Model:
                 the `set` column to the prediction output.
         Returns:
             PredictionResult: A PredictionResult object containing the predictions and metrics.
+
+        Examples:
+            >>> result = model.predict_on_label_csv("path/to/CollectedData.csv")
+            >>> result.predictions           # pd.DataFrame with MultiIndex columns
+            >>> result.metrics.pixel_error   # mean pixel error per keypoint
+
+            Skip metric computation for faster inference:
+            >>> result = model.predict_on_label_csv(
+            ...     "path/to/CollectedData.csv",
+            ...     compute_metrics=False,
+            ... )
         """
         self._load()
         # Convert this to absolute, because if relative, downstream will
@@ -352,7 +609,7 @@ class Model:
         # Point predict_dataset to the csv_file and data_dir.
         # HACK: For true multi-view model, trick predict_dataset and compute_metrics
         # into thinking this is a single-view model.
-        cfg_overrides = {
+        cfg_overrides: dict[str, Any] = {
             "data": {
                 "data_dir": str(data_dir),
                 "csv_file": str(csv_file),
@@ -379,7 +636,7 @@ class Model:
         preds_file = str(preds_file_path)
 
         df = predict_dataset(
-            cfg_pred, data_module_pred, model=self.model, preds_file=preds_file
+            model=self, data_module=data_module_pred, preds_file=preds_file, cfg=cfg_pred,
         )
 
         if compute_metrics:
@@ -392,6 +649,8 @@ class Model:
         else:
             metrics = None
 
+        if not isinstance(df, pd.DataFrame):
+            raise RuntimeError('expected a single-view DataFrame from predict_dataset')
         return PredictionResult(predictions=df, metrics=metrics)
 
     def predict_on_label_csv_multiview(
@@ -410,23 +669,26 @@ class Model:
             view of the same session. Order must match the `view_names` in the config file.
 
         See `predict_on_label_csv` docstring for other arguments."""
-        assert self.config.is_multi_view()
+        if not self.config.is_multi_view():
+            raise ValueError('predict_on_label_csv_multiview requires a multi-view model')
         self._load()
 
         view_names = self.config.cfg.data.view_names
-        assert len(csv_file_per_view) == len(
-            view_names
-        ), f"{len(csv_file_per_view)} != {len(view_names)}"
+        if len(csv_file_per_view) != len(view_names):
+            raise ValueError(
+                f'expected {len(view_names)} csv files (one per view), '
+                f'got {len(csv_file_per_view)}'
+            )
 
         # Convert this to absolute, because if relative, downstream will
         # assume its relative to the data_dir.
-        csv_file_per_view: list[Path] = [Path(f).absolute() for f in csv_file_per_view]
+        csv_file_per_view = [Path(f).absolute() for f in csv_file_per_view]
 
         if data_dir is None:
             data_dir = self.config.cfg.data.data_dir
 
         # Point predict_dataset to the csv_file and data_dir.
-        cfg_overrides = {
+        cfg_overrides: dict[str, Any] = {
             "data": {
                 "data_dir": str(data_dir),
                 "csv_file": [str(p) for p in csv_file_per_view],
@@ -448,20 +710,20 @@ class Model:
         data_module_pred = _build_datamodule_pred(cfg_pred)
 
         preds_files = []
-        for i, view_name in enumerate(view_names):
+        for i, _view_name in enumerate(view_names):
             output_dir = self.image_preds_dir() / csv_file_per_view[i].name
             output_dir.mkdir(parents=True, exist_ok=True)
             preds_files.append(str(output_dir / "predictions.csv"))
 
         # Outputs dict[str, pd.DataFrame] because inputs indicate multiview.
         view_to_df_dict = predict_dataset(
-            cfg_pred, data_module_pred, model=self.model, preds_file=preds_files
+            model=self, data_module=data_module_pred, preds_file=preds_files, cfg=cfg_pred,
         )
 
         if compute_metrics:
             metrics = {}
             for view_name, labels_file, _preds_file in zip(
-                view_names, csv_file_per_view, preds_files
+                view_names, csv_file_per_view, preds_files, strict=True
             ):
                 metrics[view_name] = compute_metrics_single(
                     cfg=self.cfg,
@@ -472,7 +734,10 @@ class Model:
         else:
             metrics = None
 
-        return MultiviewPredictionResult(predictions=view_to_df_dict, metrics=metrics)
+        return MultiviewPredictionResult(
+            predictions=cast(dict[str, pd.DataFrame], view_to_df_dict),
+            metrics=metrics,
+        )
 
     def predict_on_video_file(
         self,
@@ -493,11 +758,21 @@ class Model:
                 predictions.
             generate_labeled_video (bool, optional): Whether to save a labeled video.
                 Defaults to False.
-            progress_file (Path, optional): Path to a file to save progress information for the App.
-                Defaults to None.
+            progress_file (Path, optional): Path to a file to save progress information for the
+                App. Defaults to None.
 
         Returns:
             PredictionResult: A PredictionResult object containing the predictions and metrics.
+
+        Examples:
+            >>> result = model.predict_on_video_file("path/to/video.mp4")
+            >>> result.predictions   # pd.DataFrame, one row per frame
+
+            Save a keypoint-annotated video alongside the predictions CSV:
+            >>> result = model.predict_on_video_file(
+            ...     "path/to/video.mp4",
+            ...     generate_labeled_video=True,
+            ... )
 
         """
         self._load()
@@ -514,7 +789,7 @@ class Model:
 
         prediction_csv_file = output_dir / f"{video_file.stem}.csv"
 
-        df: pd.DataFrame = predict_video(
+        df = predict_video(
             video_file=str(video_file),
             model=self,
             output_pred_file=str(prediction_csv_file),
@@ -567,21 +842,25 @@ class Model:
                 predictions.
             generate_labeled_video (bool, optional): Whether to save a labeled video.
                 Defaults to False.
-            progress_file (Path, optional): Path to a file to save progress information for the App.
+            progress_file (Path, optional): Path to a file to save progress information for
+                the App.
 
         Returns:
             MultiviewPredictionResult: object containing the predictions and metrics for each view.
 
         """
-        assert self.config.is_multi_view()
+        if not self.config.is_multi_view():
+            raise ValueError('predict_on_video_file_multiview requires a multi-view model')
         self._load()
 
         view_names = self.config.cfg.data.view_names
-        assert len(video_file_per_view) == len(
-            view_names
-        ), f"{len(video_file_per_view)} != {len(view_names)}"
+        if len(video_file_per_view) != len(view_names):
+            raise ValueError(
+                f'expected {len(view_names)} video files (one per view), '
+                f'got {len(video_file_per_view)}'
+            )
 
-        video_file_per_view: list[Path] = [Path(f) for f in video_file_per_view]
+        video_file_per_view = [Path(f) for f in video_file_per_view]
 
         if output_dir == self.__class__.UNSPECIFIED:
             output_dir = self.video_preds_dir()
@@ -596,7 +875,7 @@ class Model:
         _view_to_video_file: dict[str, Path] = io_utils.collect_video_files_by_view(
             video_file_per_view, view_names
         )
-        video_file_per_view: list[Path] = [
+        video_file_per_view = [
             _view_to_video_file[view_name] for view_name in view_names
         ]
 
@@ -605,14 +884,14 @@ class Model:
             for video_file in video_file_per_view
         ]
 
-        df_list: list[pd.DataFrame] = predict_video(
+        df_list = predict_video(
             video_file=list(map(str, video_file_per_view)),
             model=self,
             output_pred_file=prediction_csv_file_list,
             progress_file=progress_file,
         )
         if generate_labeled_video:
-            for video_file, preds_df in zip(video_file_per_view, df_list):
+            for video_file, preds_df in zip(video_file_per_view, df_list, strict=True):
                 labeled_mp4_file = str(
                     self.labeled_videos_dir() / f"{video_file.stem}_labeled.mp4"
                 )
@@ -627,7 +906,7 @@ class Model:
         data_module = _build_datamodule_pred(self.cfg)
         if compute_metrics:
             metrics = {}
-            for view_name, preds_file in zip(view_names, prediction_csv_file_list):
+            for view_name, preds_file in zip(view_names, prediction_csv_file_list, strict=True):
                 metrics[view_name] = compute_metrics_single(
                     cfg=self.cfg,
                     labels_file=None,
@@ -637,12 +916,20 @@ class Model:
         else:
             metrics = None
 
-        df_dict = {view_name: df for view_name, df in zip(view_names, df_list)}
+        df_dict = {view_name: df for view_name, df in zip(view_names, df_list, strict=True)}
 
         return MultiviewPredictionResult(predictions=df_dict, metrics=metrics)
 
 
-def _build_datamodule_pred(cfg: DictConfig):
+def _build_datamodule_pred(cfg: DictConfig | ListConfig) -> BaseDataModule | UnlabeledDataModule:
+    """Build a data module configured for prediction (no augmentation).
+
+    Args:
+        cfg: model config; augmentation is overridden to ``"default"`` (resize only).
+
+    Returns:
+        data module ready for use with `predict_dataset`.
+    """
     cfg_pred = copy.deepcopy(cfg)
     cfg_pred.training.imgaug = "default"
     imgaug_transform_pred = get_imgaug_transform(cfg=cfg_pred)

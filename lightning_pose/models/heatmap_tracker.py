@@ -1,12 +1,10 @@
 """Models that produce heatmaps of keypoints from images."""
 
-from typing import Any, Tuple
+from typing import Any, Literal
 
 import torch
-from omegaconf import DictConfig
-from torchtyping import TensorType
-from typeguard import typechecked
-from typing_extensions import Literal
+from jaxtyping import Float
+from omegaconf import DictConfig, ListConfig
 
 from lightning_pose.data.datatypes import (
     HeatmapLabeledBatchDict,
@@ -41,9 +39,9 @@ class HeatmapTracker(BaseSupervisedTracker):
         pretrained: bool = True,
         torch_seed: int = 123,
         optimizer: str = "Adam",
-        optimizer_params: DictConfig | dict | None = None,
+        optimizer_params: DictConfig | ListConfig | dict | None = None,
         lr_scheduler: str = "multisteplr",
-        lr_scheduler_params: DictConfig | dict | None = None,
+        lr_scheduler_params: DictConfig | ListConfig | dict | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize a heatmap-based pose estimation model with conv or transformer backbone.
@@ -104,12 +102,10 @@ class HeatmapTracker(BaseSupervisedTracker):
     def forward(
         self,
         images: (
-            TensorType["batch", "channels":3, "image_height", "image_width"]
-            | TensorType["batch", "views", "channels":3, "image_height", "image_width"]
+            Float[torch.Tensor, "batch channels image_height image_width"]
+            | Float[torch.Tensor, "batch views channels image_height image_width"]
         ),
-    ) -> TensorType[
-        "num_valid_outputs", "num_keypoints", "heatmap_height", "heatmap_width"
-    ]:
+    ) -> Float[torch.Tensor, "num_valid_outputs num_keypoints heatmap_height heatmap_width"]:
         """Forward pass through the network."""
         # we get one representation for each desired output.
         shape = images.shape
@@ -162,8 +158,8 @@ class HeatmapTracker(BaseSupervisedTracker):
         batch_idx: int,
         return_heatmaps: bool | None = False,
     ) -> (
-        Tuple[torch.Tensor, torch.Tensor]
-        | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     ):
         """Predict heatmaps and keypoints for a batch of video frames.
 
@@ -174,10 +170,10 @@ class HeatmapTracker(BaseSupervisedTracker):
         """
         if "images" in batch_dict.keys():  # can't do isinstance(o, c) on TypedDicts
             # labeled image dataloaders
-            images = batch_dict["images"]
+            images = batch_dict["images"]  # type: ignore[typeddict-item]
         else:
             # unlabeled dali video dataloaders
-            images = batch_dict["frames"]
+            images = batch_dict["frames"]  # type: ignore[typeddict-item]
         # images -> heatmaps
         predicted_heatmaps = self.forward(images)
         # heatmaps -> keypoints
@@ -189,7 +185,13 @@ class HeatmapTracker(BaseSupervisedTracker):
         else:
             return predicted_keypoints, confidence
 
-    def get_parameters(self):
+    def get_parameters(self) -> list[dict]:
+        """Return per-parameter-group optimizer configuration for backbone and head.
+
+        Returns:
+            List of dicts with ``"params"``, ``"name"``, and optionally ``"lr"`` keys; the
+            backbone starts with learning rate 0 (frozen until unfreezing).
+        """
         params = [
             {"params": self.backbone.parameters(), "lr": 0, "name": "backbone"},
             {"params": self.head.parameters(), "name": "head"},
@@ -197,7 +199,6 @@ class HeatmapTracker(BaseSupervisedTracker):
         return params
 
 
-@typechecked
 class SemiSupervisedHeatmapTracker(SemiSupervisedTrackerMixin, HeatmapTracker):
     """Model produces heatmaps of keypoints from labeled/unlabeled images."""
 
@@ -211,9 +212,9 @@ class SemiSupervisedHeatmapTracker(SemiSupervisedTrackerMixin, HeatmapTracker):
         pretrained: bool = True,
         torch_seed: int = 123,
         optimizer: str = "Adam",
-        optimizer_params: DictConfig | dict | None = None,
+        optimizer_params: DictConfig | ListConfig | dict | None = None,
         lr_scheduler: str = "multisteplr",
-        lr_scheduler_params: DictConfig | dict | None = None,
+        lr_scheduler_params: DictConfig | ListConfig | dict | None = None,
         **kwargs: Any,
     ) -> None:
         """

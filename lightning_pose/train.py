@@ -8,30 +8,30 @@ import random
 import re
 import shutil
 import sys
+from collections.abc import Generator
 from datetime import datetime
 from pathlib import Path
 
 import lightning.pytorch as pl
 import numpy as np
 import torch
+from lightning.pytorch.loggers import TensorBoardLogger
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
-from typeguard import typechecked
 
 import lightning_pose
-from lightning_pose.api.model import Model
-from lightning_pose.api.model_config import ModelConfig
-from lightning_pose.utils import pretty_print_cfg, pretty_print_str
-from lightning_pose.utils.io import (
-    return_absolute_data_paths,
-)
-from lightning_pose.utils.scripts import (
-    calculate_steps_per_epoch,
-    get_callbacks,
+from lightning_pose.api import Model, ModelConfig
+from lightning_pose.callbacks import get_callbacks
+from lightning_pose.data import (
     get_data_module,
     get_dataset,
     get_imgaug_transform,
-    get_loss_factories,
-    get_model,
+)
+from lightning_pose.data.datamodules import BaseDataModule, UnlabeledDataModule
+from lightning_pose.losses import get_loss_factories
+from lightning_pose.models import get_model
+from lightning_pose.utils import pretty_print_cfg, pretty_print_str
+from lightning_pose.utils.io import (
+    return_absolute_data_paths,
 )
 
 # to ignore imports for sphinx-autoapidoc
@@ -40,7 +40,15 @@ __all__ = ["train"]
 
 # TODO: Replace with contextlib.chdir in python 3.11.
 @contextlib.contextmanager
-def chdir(dir: str | Path):
+def chdir(dir: str | Path) -> Generator[None, None, None]:
+    """Context manager that temporarily changes the working directory.
+
+    Args:
+        dir: directory to change into for the duration of the context.
+
+    Yields:
+        None; the current working directory is restored on exit.
+    """
     pwd = os.getcwd()
     os.chdir(dir)
     try:
@@ -49,8 +57,33 @@ def chdir(dir: str | Path):
         os.chdir(pwd)
 
 
-@typechecked
-def train(cfg: DictConfig, model_dir: str | Path | None = None, skip_evaluation=False) -> Model:
+def calculate_steps_per_epoch(data_module: BaseDataModule) -> int:
+    """Compute the number of optimizer steps per training epoch.
+
+    For semi-supervised (unlabeled) data modules a minimum of 10 steps per epoch is enforced
+    so that the model sees sufficient unlabeled data even when labeled data is scarce.
+
+    Args:
+        data_module: data module whose train dataset size and batch size are used.
+
+    Returns:
+        Integer number of steps per epoch.
+    """
+    assert data_module.train_dataset is not None
+    train_dataset_length = len(data_module.train_dataset)
+    steps_per_epoch = math.ceil(train_dataset_length / data_module.train_batch_size)
+
+    # To understand why we do this, see 'max_size_cycle' in UnlabeledDataModule.
+    if isinstance(data_module, UnlabeledDataModule):
+        steps_per_epoch = max(10, steps_per_epoch)
+    return steps_per_epoch
+
+
+def train(
+    cfg: DictConfig | ListConfig,
+    model_dir: str | Path | None = None,
+    skip_evaluation: bool = False,
+) -> Model:
     """
     Trains a model using the configuration `cfg`. Saves model to `model_dir`
     (defaults to cwd if unspecified).
@@ -84,14 +117,23 @@ def train(cfg: DictConfig, model_dir: str | Path | None = None, skip_evaluation=
     return model
 
 
-def _absolute_csv_file(csv_file, data_dir):
+def _absolute_csv_file(csv_file: str | Path, data_dir: str | Path) -> Path:
+    """Return an absolute path to a CSV file, joining with data_dir if necessary.
+
+    Args:
+        csv_file: path to the CSV file; may be relative or absolute.
+        data_dir: base directory used to resolve relative paths.
+
+    Returns:
+        Absolute ``pathlib.Path`` to the CSV file.
+    """
     csv_file = Path(csv_file)
     if not csv_file.is_absolute():
         return Path(data_dir) / csv_file
     return csv_file
 
 
-def _evaluate_on_training_dataset(model: Model, ood_mode=False):
+def _evaluate_on_training_dataset(model: Model, ood_mode: bool = False) -> None:
     """Arguments:
     ood_mode: look for "_new"-suffixed versions of the training csv file"""
     if model.config.is_single_view():
@@ -171,7 +213,8 @@ def _evaluate_on_training_dataset(model: Model, ood_mode=False):
         # Copy output files to model_dir for backward-compatibility.
         # New users should look up these files in image_preds.
         for p_file in (model.image_preds_dir() / csv_file.name).glob("predictions*.csv"):
-            metric_suffix = re.match(r"predictions(.*)\.csv", p_file.name)[1]
+            m = re.match(r"predictions(.*)\.csv", p_file.name)
+            metric_suffix = m[1] if m else ""
             out_file = "predictions"
             if len(csv_files) > 1:
                 out_file += "_" + view_name
@@ -185,7 +228,12 @@ def _evaluate_on_training_dataset(model: Model, ood_mode=False):
             shutil.copy(p_file, out_file)
 
 
-def _predict_test_videos(model: Model):
+def _predict_test_videos(model: Model) -> None:
+    """Run video prediction on test videos specified in the config, if enabled.
+
+    Args:
+        model: trained model used for prediction.
+    """
     if model.config.cfg.eval.predict_vids_after_training:
         pretty_print_str("Predicting videos in cfg.eval.test_videos_directory...")
         # dealing with multiview
@@ -206,7 +254,16 @@ def _predict_test_videos(model: Model):
                 )
 
 
-def _train(cfg: DictConfig, status_file: Path = None) -> Model:
+def _train(cfg: DictConfig | ListConfig, status_file: Path | None = None) -> Model:
+    """Build data/model objects, train, and return the trained model.
+
+    Args:
+        cfg: hydra config containing all training parameters.
+        status_file: optional path to a JSON file where training progress will be written.
+
+    Returns:
+        The trained ``Model`` instance.
+    """
     # reset all seeds
     seed = 0
     os.environ["PYTHONHASHSEED"] = str(seed)
@@ -299,12 +356,12 @@ def _train(cfg: DictConfig, status_file: Path = None) -> Model:
     # ----------------------------------------------------------------------------------
 
     # logger
-    logger = pl.loggers.TensorBoardLogger("tb_logs", name=cfg.model.model_name)
+    logger = TensorBoardLogger("tb_logs", name=cfg.model.model_name)
     # Log hydra config to tensorboard as helpful metadata.
     for key, value in cfg.items():
         logger.experiment.add_text(
-            "hydra_config_%s" % key,
-            "```\n%s```" % (value if isinstance(value, str) else OmegaConf.to_yaml(value))
+            f"hydra_config_{key}",
+            f"```\n{value if isinstance(value, str) else OmegaConf.to_yaml(value)}```",
         )
 
     # early stopping, learning rate monitoring, model checkpointing, backbone unfreezing

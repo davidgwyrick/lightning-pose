@@ -1,13 +1,26 @@
+"""Entry point for the litpose command-line interface."""
+
 from __future__ import annotations
 
 import sys
+from importlib.metadata import version
 
 from . import friendly
 from .commands import COMMANDS
 
 
-def _build_parser():
+def _build_parser() -> friendly.ArgumentParser:
+    """Build and return the top-level argument parser with all subcommands registered.
+
+    Returns:
+        Configured ``ArgumentParser`` with all CLI subcommands attached.
+    """
     parser = friendly.ArgumentParser()
+    parser.add_argument(
+        '--version',
+        action='version',
+        version=f'lightning-pose {version("lightning-pose")}',
+    )
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
@@ -16,18 +29,19 @@ def _build_parser():
     )
 
     # Dynamically register all available commands
-    for name, module in COMMANDS.items():
+    for _name, module in COMMANDS.items():
         module.register_parser(subparsers)
 
     return parser
 
 
-def main():
+def main() -> None:
+    """Entry point for the litpose CLI; parse arguments and dispatch to the appropriate command."""
     parser = _build_parser()
 
     # If no commands provided, display the help message.
     if len(sys.argv) == 1:
-        parser.print_help(sys.stderr)
+        parser.print_help(sys.stderr)  # type: ignore[arg-type]
         sys.exit(1)
 
     args = parser.parse_args()

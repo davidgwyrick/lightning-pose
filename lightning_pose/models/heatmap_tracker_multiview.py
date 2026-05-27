@@ -1,12 +1,12 @@
 """Models that produce heatmaps of keypoints from images on multiview datasets."""
 
 import math
-from typing import Any, Literal, Tuple
+from typing import Any, Literal
 
 import torch
-from omegaconf import DictConfig
+from jaxtyping import Float
+from omegaconf import DictConfig, ListConfig
 from torch import nn
-from torchtyping import TensorType
 
 from lightning_pose.data.cameras import project_3d_to_2d, project_camera_pairs_to_3d
 from lightning_pose.data.datatypes import (
@@ -48,12 +48,12 @@ class HeatmapTrackerMultiviewTransformer(BaseSupervisedTracker):
         downsample_factor: Literal[1, 2, 3] = 2,
         torch_seed: int = 123,
         optimizer: str = "Adam",
-        optimizer_params: DictConfig | dict | None = None,
+        optimizer_params: DictConfig | ListConfig | dict | None = None,
         lr_scheduler: str = "multisteplr",
-        lr_scheduler_params: DictConfig | dict | None = None,
+        lr_scheduler_params: DictConfig | ListConfig | dict | None = None,
         image_size: int = 256,
         **kwargs: Any,
-    ):
+    ) -> None:
         """Initialize a multi-view model with transformer backbone.
         Args:
             num_keypoints: number of body parts
@@ -135,8 +135,8 @@ class HeatmapTrackerMultiviewTransformer(BaseSupervisedTracker):
 
     def forward_vit(
         self,
-        images: TensorType["view * batch", "channels":3, "image_height", "image_width"],
-    ):
+        images: Float[torch.Tensor, "view_x_batch channels image_height image_width"],
+    ) -> Float[torch.Tensor, "view_x_batch embedding_dim height width"]:
         """Override forward pass through the vision encoder to add view embeddings."""
 
         # outputs = self.vision_encoder(
@@ -151,12 +151,12 @@ class HeatmapTrackerMultiviewTransformer(BaseSupervisedTracker):
 
         # create patch embeddings and add position embeddings; remove CLS token
         try:
-            embedding_output = self.backbone.vision_encoder.embeddings(
+            embedding_output = self.backbone.vision_encoder.embeddings(  # type: ignore[operator]
                 images, bool_masked_pos=None, interpolate_pos_encoding=True,
             )[:, 1:]
         except TypeError:
             # DINOv3 doesn't have `interpolate_pos_encoding` arg, does this by default
-            embedding_output = self.backbone.vision_encoder.embeddings(
+            embedding_output = self.backbone.vision_encoder.embeddings(  # type: ignore[operator]
                 images, bool_masked_pos=None,
             )[:, 1:]
         # shape: (view * batch, num_patches, embedding_dim)
@@ -186,15 +186,14 @@ class HeatmapTrackerMultiviewTransformer(BaseSupervisedTracker):
         )
 
         # push data through vit encoder
-        encoder_outputs = self.backbone.vision_encoder.encoder(
+        encoder_outputs = self.backbone.vision_encoder.encoder(  # type: ignore[operator]
             embedding_output,
             head_mask=None,
-            output_attentions=False,
             output_hidden_states=False,
             return_dict=None,
         )
         sequence_output = encoder_outputs[0]
-        outputs = self.backbone.vision_encoder.layernorm(sequence_output)
+        outputs = self.backbone.vision_encoder.layernorm(sequence_output)  # type: ignore[operator]
         # shape: (batch, view * num_patches, embedding_dim)
 
         # reshape data to (view * batch, embedding_dim, height, width) for head processing
@@ -210,13 +209,15 @@ class HeatmapTrackerMultiviewTransformer(BaseSupervisedTracker):
 
     def forward(
         self,
-        batch_dict: MultiviewHeatmapLabeledBatchDict,
-    ) -> TensorType["num_valid_outputs", "num_keypoints", "heatmap_height", "heatmap_width"]:
+        batch_dict: (
+            MultiviewHeatmapLabeledBatchDict | UnlabeledBatchDict | MultiviewUnlabeledBatchDict
+        ),
+    ) -> Float[torch.Tensor, "num_valid_outputs num_keypoints heatmap_height heatmap_width"]:
         """Forward pass through the network.
 
         Batch options
         -------------
-        - TensorType["batch", "view", "channels":3, "image_height", "image_width"]
+        - Float[torch.Tensor, "batch view channels image_height image_width"]
           multiview labeled batch or unlabeled batch from DALI
 
         """
@@ -224,10 +225,10 @@ class HeatmapTrackerMultiviewTransformer(BaseSupervisedTracker):
         # extract pixel data from batch
         if "images" in batch_dict.keys():  # can't do isinstance(o, c) on TypedDicts
             # labeled image dataloaders
-            images = batch_dict["images"]
+            images = batch_dict["images"]  # type: ignore[typeddict-item]
         else:
             # unlabeled dali video dataloaders
-            images = batch_dict["frames"]
+            images = batch_dict["frames"]  # type: ignore[typeddict-item]
 
         batch_size, num_views, channels, img_height, img_width = images.shape
 
@@ -270,6 +271,7 @@ class HeatmapTrackerMultiviewTransformer(BaseSupervisedTracker):
                     dist=batch_dict["distortions"].float(),
                 )
                 keypoints_targ_3d = batch_dict["keypoints_3d"]
+                assert self.loss_factory is not None
                 if "supervised_reprojection_heatmap_mse" in \
                         self.loss_factory.loss_instance_dict.keys():
                     # project from 3D back to 2D in original image coordinates
@@ -314,7 +316,7 @@ class HeatmapTrackerMultiviewTransformer(BaseSupervisedTracker):
         batch_dict: MultiviewHeatmapLabeledBatchDict | UnlabeledBatchDict,
         batch_idx: int,
         return_heatmaps: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Predict heatmaps and keypoints for a batch of video frames.
 
         Assuming a DALI video loader is passed in
@@ -334,7 +336,13 @@ class HeatmapTrackerMultiviewTransformer(BaseSupervisedTracker):
         else:
             return pred_keypoints, confidence
 
-    def get_parameters(self):
+    def get_parameters(self) -> list[dict]:
+        """Return per-parameter-group optimizer configuration for backbone, head, and embeddings.
+
+        Returns:
+            List of dicts with ``"params"`` and ``"name"`` keys; the backbone starts with
+            learning rate 0 (frozen until unfreezing), and view embeddings are trained normally.
+        """
         params = [
             {"params": self.backbone.parameters(), "name": "backbone", "lr": 0.0},
             {"params": self.head.parameters(), "name": "head"},
@@ -362,12 +370,12 @@ class SemiSupervisedHeatmapTrackerMultiviewTransformer(
         downsample_factor: Literal[1, 2, 3] = 2,
         torch_seed: int = 123,
         optimizer: str = "Adam",
-        optimizer_params: DictConfig | dict | None = None,
+        optimizer_params: DictConfig | ListConfig | dict | None = None,
         lr_scheduler: str = "multisteplr",
-        lr_scheduler_params: DictConfig | dict | None = None,
+        lr_scheduler_params: DictConfig | ListConfig | dict | None = None,
         image_size: int = 256,
         **kwargs: Any,
-    ):
+    ) -> None:
         """Initialize a semi-supervised multi-view model with transformer backbone.
 
         Args:

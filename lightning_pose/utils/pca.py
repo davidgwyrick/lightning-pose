@@ -1,35 +1,32 @@
 """PCA class to assist with computing PCA losses."""
 
 import warnings
-from typing import Literal
+from typing import Any, Literal, cast
 
 import numpy as np
 import torch
+from jaxtyping import Float
 from omegaconf import ListConfig
 from sklearn.decomposition import PCA
 from sklearn.decomposition._pca import _infer_dimension
 from sklearn.utils._array_api import _convert_to_numpy, get_namespace
 from sklearn.utils.extmath import stable_cumsum, svd_flip
-from torchtyping import TensorType
-from typeguard import typechecked
 
 from lightning_pose.data.datamodules import BaseDataModule, UnlabeledDataModule
 from lightning_pose.data.datasets import MultiviewHeatmapDataset
-from lightning_pose.data.utils import DataExtractor
-from lightning_pose.losses.helpers import (
-    EmpiricalEpsilon,
-    convert_dict_values_to_tensors,
-)
+from lightning_pose.data.extractor import DataExtractor
 
 # to ignore imports for sphix-autoapidoc
 __all__ = [
-    "KeypointPCA",
     "ComponentChooser",
+    "EmpiricalEpsilon",
+    "KeypointPCA",
+    "convert_dict_values_to_tensors",
     "format_multiview_data_for_pca",
 ]
 
 
-class KeypointPCA(object):
+class KeypointPCA:
     """Class to collect data from a dataloader and compute PCA params."""
 
     def __init__(
@@ -40,7 +37,7 @@ class KeypointPCA(object):
         empirical_epsilon_percentile: float = 99.0,
         mirrored_column_matches: ListConfig | list | None = None,
         columns_for_singleview_pca: ListConfig | list | None = None,
-        device: Literal["cuda", "cpu"] | torch.device = "cpu",
+        device: str | torch.device = "cpu",
         centering_method: Literal["mean", "median"] | None = None,
     ) -> None:
         """Initialize KeypointPCA.
@@ -78,7 +75,7 @@ class KeypointPCA(object):
                     "mirrored view"
                 )
             num_views = len(data_module.dataset.view_names)
-            num_keypoints = data_module.dataset.num_keypoints / num_views  # keypoints per view
+            num_keypoints = cast(int, data_module.dataset.num_keypoints) / num_views
             mirrored_column_matches = [
                 (v * num_keypoints + np.array(mirrored_column_matches, dtype=int)).tolist()
                 for v in range(num_views)
@@ -90,18 +87,33 @@ class KeypointPCA(object):
         self.centering_method = centering_method
 
     def _get_data(self) -> None:
+        """Extract labeled keypoint data from the training split and store in ``self.data_arr``."""
         self.data_arr, _ = DataExtractor(
             data_module=self.data_module, cond="train", extract_images=False,
             remove_augmentations=True,
         )()
 
     def _multiview_format(
-        self, data_arr: TensorType["num_original_samples", "num_original_dims"]
-    ) -> TensorType["num_original_samples_times_num_selected_keypoints", "two_times_num_views"]:
+        self, data_arr: Float[torch.Tensor, "num_original_samples num_original_dims"]
+    ) -> Float[
+        torch.Tensor, "num_original_samples_times_num_selected_keypoints two_times_num_views"
+    ]:
+        """Reformat keypoint data for multiview PCA.
+
+        Each observation becomes a single body part across all views, with coordinates from
+        different views concatenated along the feature axis.
+
+        Args:
+            data_arr: raw keypoint array of shape ``(batch, 2*num_keypoints)``.
+
+        Returns:
+            Reformatted array of shape ``(batch * num_selected_keypoints, 2*num_views)``.
+        """
         # original shape = (batch, 2 * num_keypoints) where `num_keypoints` includes
         # keypoints views from multiple views.
         data_arr = data_arr.reshape(data_arr.shape[0], data_arr.shape[1] // 2, 2)
         # shape = (batch_size, num_keypoints, 2)
+        assert self.mirrored_column_matches is not None
         data_arr = format_multiview_data_for_pca(
             data_arr=data_arr,
             mirrored_column_matches=self.mirrored_column_matches,
@@ -109,11 +121,22 @@ class KeypointPCA(object):
         return data_arr
 
     def _singleview_format(
-        self, data_arr: TensorType["num_original_samples", "num_original_dims"]
+        self, data_arr: Float[torch.Tensor, "num_original_samples num_original_dims"]
     ) -> (
-        TensorType["num_original_samples", "num_selected_dims"]
-        | TensorType["num_original_samples", "num_original_dims"]
+        Float[torch.Tensor, "num_original_samples num_selected_dims"]
+        | Float[torch.Tensor, "num_original_samples num_original_dims"]
     ):
+        """Reformat keypoint data for singleview PCA, optionally selecting a subset of keypoints.
+
+        Also applies centring if ``self.centering_method`` is set.
+
+        Args:
+            data_arr: raw keypoint array of shape ``(batch, 2*num_keypoints)``.
+
+        Returns:
+            Reformatted array of shape ``(batch, 2*num_selected_keypoints)``; if
+            ``columns_for_singleview_pca`` is ``None``, all keypoints are retained.
+        """
         # original shape = (batch, 2 * num_keypoints)
         # reshape to (batch, num_keypoints, 2) to easily select columns
         # [1,2,3,4]
@@ -139,16 +162,25 @@ class KeypointPCA(object):
         return data_arr
 
     def _format_data(
-        self, data_arr: TensorType["num_original_samples", "num_original_dims"]
-    ) -> TensorType:
+        self, data_arr: Float[torch.Tensor, "num_original_samples num_original_dims"]
+    ) -> torch.Tensor:
+        """Dispatch to the appropriate data-formatting method based on ``self.loss_type``.
+
+        Args:
+            data_arr: raw keypoint array of shape ``(batch, 2*num_keypoints)``.
+
+        Returns:
+            Reformatted array suitable for PCA fitting.
+
+        Raises:
+            NotImplementedError: if ``self.loss_type`` is not ``"pca_singleview"`` or
+                ``"pca_multiview"``.
+        """
         # Union[
-        #     TensorType["num_original_samples", "num_selected_dims"],  # singleview filtered
-        #     TensorType[
-        #         "num_original_samples", "num_original_dims"
-        #     ],  # singleview unfiltered
-        #     TensorType[
-        #         "num_original_samples_times_num_selected_keypoints", "two_times_num_views"
-        #     ]],  # multiview
+        #     Float[torch.Tensor, "num_original_samples num_selected_dims"],  # singleview filtered
+        #     Float[torch.Tensor, "num_original_samples num_original_dims"],  # unfiltered
+        #     Float[torch.Tensor,  # multiview
+        #         "num_original_samples_times_num_selected_keypoints two_times_num_views"]]
         if self.loss_type == "pca_multiview":
             return self._multiview_format(data_arr=data_arr)
         elif self.loss_type == "pca_singleview":
@@ -157,7 +189,11 @@ class KeypointPCA(object):
             raise NotImplementedError
 
     def _check_data(self) -> None:
+        """Validate that ``self.data_arr`` has more observations than dimensions.
 
+        Raises:
+            ValueError: if the number of samples is less than the number of observation dimensions.
+        """
         # ensure we have more rows than columns after doing nan filtering
         if self.data_arr.shape[0] < self.data_arr.shape[1]:
             raise ValueError(
@@ -166,12 +202,19 @@ class KeypointPCA(object):
             )
 
     def _fit_pca(self) -> None:
+        """Fit a ``NaNPCA`` model on ``self.data_arr`` and store it in ``self.pca_object``."""
         # fit PCA with the full number of comps on the cleaned-up data array.
         # note self.data_arr is a tensor but sklearn's PCA function is fine with it
         self.pca_object = NaNPCA(svd_solver="covariance_eigh")
         self.pca_object.fit(X=self.data_arr)
 
     def _choose_n_components(self) -> None:
+        """Determine and store the number of PCA components to retain in
+        ``self._n_components_kept``.
+
+        For multiview PCA this is always 3 (x, y, z). For singleview PCA the
+        :class:`ComponentChooser` is used with ``self.components_to_keep``.
+        """
         if self.loss_type == "pca_multiview":
             # all views can be explained by 3 (x,y,z) coords
             # ignore self.components_to_keep_argument
@@ -180,7 +223,8 @@ class KeypointPCA(object):
                 warnings.warn(
                     f"for {self.loss_type} loss, you specified {self.components_to_keep} "
                     f"components_to_keep, but we will instead keep {self._n_components_kept} "
-                    f"components"
+                    f"components",
+                    stacklevel=2,
                 )
         elif self.loss_type == "pca_singleview":
             if self.pca_object is not None:
@@ -191,10 +235,17 @@ class KeypointPCA(object):
         assert isinstance(self._n_components_kept, int)
 
     def pca_prints(self) -> None:
+        """Print a summary of PCA results including explained variance.
+
+        Must be called after fitting PCA and choosing the number of components.
+        """
         # call after we've fitted a pca object and selected how many components to keep
+        assert self.pca_object is not None
         pca_prints(self.pca_object, self.loss_type, self._n_components_kept)
 
     def _set_parameter_dict(self) -> None:
+        """Compute and store the PCA parameter dict (mean, eigenvectors, epsilon) as tensors."""
+        assert self.pca_object is not None
 
         self.parameters = {  # dict with same keys as loss_param_dict
             "mean": self.pca_object.mean_,
@@ -204,13 +255,16 @@ class KeypointPCA(object):
 
         self.parameters = convert_dict_values_to_tensors(self.parameters, self.device)
 
-        self.parameters["epsilon"] = EmpiricalEpsilon(
+        epsilon_val = EmpiricalEpsilon(
             percentile=self.empirical_epsilon_percentile
         )(loss=self.compute_reprojection_error())
+        self.parameters["epsilon"] = torch.tensor(
+            epsilon_val, dtype=torch.float, device=self.device
+        )
 
     def reproject(
-        self, data_arr: TensorType["num_samples", "sample_dim"] | None = None
-    ) -> TensorType["num_samples", "sample_dim"]:
+        self, data_arr: Float[torch.Tensor, "num_samples sample_dim"] | None = None
+    ) -> Float[torch.Tensor, "num_samples sample_dim"]:
         """Reproject a data array using the fixed pca parameters.
 
         This transformation is implemented as in scikit-learn
@@ -239,8 +293,8 @@ class KeypointPCA(object):
         return reprojection
 
     def compute_reprojection_error(
-        self, data_arr: TensorType["num_samples", "sample_dim"] | None = None
-    ) -> TensorType["num_samples", "sample_dim_over_two"]:
+        self, data_arr: Float[torch.Tensor, "num_samples sample_dim"] | None = None
+    ) -> Float[torch.Tensor, "num_samples sample_dim_over_two"]:
         """returns error per 2D keypoint"""
         if data_arr is None:
             data_arr = self.data_arr.to(self.device)
@@ -254,6 +308,7 @@ class KeypointPCA(object):
         return reprojection_loss
 
     def __call__(self) -> None:
+        """Run the full PCA pipeline: extract data, format, check, fit, and set parameters."""
 
         # save training data in self.data_arr
         self._get_data()
@@ -360,7 +415,13 @@ class NaNPCA(PCA):
         # Call fit for full SVD
         return self._fit_full(X, n_components, xp, is_array_api_compliant)
 
-    def _fit_full(self, X, n_components, xp, is_array_api_compliant):
+    def _fit_full(
+        self,
+        X: np.ndarray,
+        n_components: Any,
+        xp: Any,
+        is_array_api_compliant: bool,
+    ) -> tuple[Any, ...]:
         """Fit the model by computing full SVD on X.
 
         This is a modification of the sklearn function that now allows for NaNs in the inputs.
@@ -469,7 +530,7 @@ class NaNPCA(PCA):
                 )
             else:
                 explained_variance_ratio_np = explained_variance_ratio_
-            ratio_cumsum = stable_cumsum(explained_variance_ratio_np)
+            ratio_cumsum = stable_cumsum(explained_variance_ratio_np)  # type: ignore[operator]
             n_components = np.searchsorted(ratio_cumsum, n_components, side="right") + 1
 
         # Compute noise covariance using Probabilistic PCA model
@@ -487,6 +548,7 @@ class NaNPCA(PCA):
         # - ensure that the kept components are allocated contiguously in
         #   memory to make the transform method faster by leveraging cache
         #   locality.
+        assert components_ is not None
         self.components_ = xp.asarray(components_[:n_components, :], copy=True)
 
         # We do the same for the other arrays for the sake of consistency.
@@ -500,7 +562,7 @@ class NaNPCA(PCA):
 
         return U, S, Vt, X, x_is_centered, xp
 
-    def transform(self, X):
+    def transform(self, X: np.ndarray) -> np.ndarray:
         """Apply dimensionality reduction to X including missing data (Nans).
 
         X is projected on the first principal components previously extracted
@@ -550,7 +612,34 @@ class NaNPCA(PCA):
         return X_transformed
 
 
-@typechecked
+class EmpiricalEpsilon:
+    """Find percentile value of a given loss tensor."""
+
+    def __init__(self, percentile: float) -> None:
+        """Initialize EmpiricalEpsilon.
+
+        Args:
+            percentile: the percentile (0–100) of the loss distribution to use as epsilon.
+        """
+        self.percentile = percentile
+
+    def __call__(self, loss: torch.Tensor | np.ndarray) -> float:
+        """Compute the percentile of some loss, to use as an epsilon-insensitive loss.
+
+        Args:
+            loss: tensor with scalar loss per term (e.g., loss per image, or loss per
+                keypoint, etc.)
+
+        Returns:
+            the percentile of the loss which we use as epsilon
+        """
+        if isinstance(loss, torch.Tensor):
+            flattened_loss = loss.flatten().clone().detach().cpu().numpy()
+        else:
+            flattened_loss = loss.flatten()
+        return float(np.nanpercentile(flattened_loss, self.percentile, axis=0))
+
+
 class ComponentChooser:
     """Determine the number of PCA components to keep."""
 
@@ -581,9 +670,21 @@ class ComponentChooser:
 
     @property
     def cumsum_explained_variance(self) -> np.ndarray:
+        """Cumulative sum of the explained variance ratios of the fitted PCA object.
+
+        Returns:
+            1-D array where index ``i`` is the fraction of variance explained by the first
+            ``i+1`` components.
+        """
         return np.cumsum(self.fitted_pca_object.explained_variance_ratio_)
 
     def _check_components_to_keep(self) -> None:
+        """Validate the ``components_to_keep`` argument.
+
+        Raises:
+            ValueError: if an integer exceeds the number of fitted components, or a float is
+                outside ``[0.0, 1.0]``.
+        """
         # if int, ensure it's not too big
         if type(self.components_to_keep) is int:
             if self.components_to_keep > self.fitted_pca_object.n_components_:
@@ -600,6 +701,12 @@ class ComponentChooser:
                 )
 
     def _find_first_threshold_cross(self) -> int:
+        """Return the minimum number of components needed to exceed the variance threshold.
+
+        Returns:
+            Integer number of components to keep to reach ``self.components_to_keep`` cumulative
+            explained variance.
+        """
         # find the index of the first element above a min_variance_explained threshold
         assert type(
             self.components_to_keep is float
@@ -616,33 +723,47 @@ class ComponentChooser:
             return len(self.fitted_pca_object.explained_variance_)
 
     def __call__(self) -> int:
+        """Return the number of PCA components to retain.
+
+        Returns:
+            Integer number of components.
+
+        Raises:
+            TypeError: if ``self.components_to_keep`` is neither ``int`` nor ``float``.
+        """
         if type(self.components_to_keep) is int:
             # return integer as is
             return self.components_to_keep
         elif type(self.components_to_keep) is float:
             # find that integer that crosses the minimum explained variance
             return self._find_first_threshold_cross()
-
-
-@typechecked
-def pca_prints(pca: PCA, condition: str, components_to_keep: int) -> None:
-    print("Results of running PCA ({}) on keypoints:".format(condition))
-    print(
-        "Kept {}/{} components, and found:".format(
-            components_to_keep, pca.n_components_
+        raise TypeError(
+            f'components_to_keep must be int or float, got {type(self.components_to_keep)}'
         )
+
+
+def pca_prints(pca: PCA, condition: str, components_to_keep: int) -> None:
+    """Print a summary of PCA results to stdout.
+
+    Args:
+        pca: a fitted PCA or NaNPCA object.
+        condition: label describing the PCA type (e.g., ``"pca_singleview"``).
+        components_to_keep: number of components retained after dimensionality selection.
+    """
+    print(f"Results of running PCA ({condition}) on keypoints:")
+    print(
+        f"Kept {components_to_keep}/{pca.n_components_} components, and found:"
     )
     evr = np.round(pca.explained_variance_ratio_, 3)
-    print("Explained variance ratio: {}".format(evr))
+    print(f"Explained variance ratio: {evr}")
     tev = np.round(np.sum(pca.explained_variance_ratio_[:components_to_keep]), 3)
-    print("Variance explained by {} components: {}".format(components_to_keep, tev))
+    print(f"Variance explained by {components_to_keep} components: {tev}")
 
 
-# @typechecked
 def format_multiview_data_for_pca(
-    data_arr: TensorType["batch", "num_keypoints", "2"],
+    data_arr: Float[torch.Tensor, "batch num_keypoints 2"],
     mirrored_column_matches: ListConfig | list,
-) -> TensorType["batch_times_num_selected_keypoints", "two_times_num_views"]:
+) -> Float[torch.Tensor, "batch_times_num_selected_keypoints two_times_num_views"]:
     """Reformat multiview data so each observation is a single body part across views.
 
     Args:
@@ -673,3 +794,22 @@ def format_multiview_data_for_pca(
         data_arr_views, dim=0
     )  # -> 2 * n_views X num_frames*num_bodyparts
     return data_arr.T  # note the transpose
+
+
+def convert_dict_values_to_tensors(
+    param_dict: dict[str, np.ndarray | float],
+    device: str | torch.device,
+) -> dict[str, torch.Tensor]:
+    """Convert all values in a parameter dictionary to float tensors on the given device.
+
+    Args:
+        param_dict: mapping from parameter name to scalar or array value.
+        device: target device for the output tensors.
+
+    Returns:
+        Dictionary with the same keys and values converted to ``torch.float`` tensors.
+    """
+    return {
+        key: torch.tensor(val, dtype=torch.float, device=device)
+        for key, val in param_dict.items()
+    }

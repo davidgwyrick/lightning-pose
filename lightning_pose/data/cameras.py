@@ -1,14 +1,19 @@
+"""Camera geometry utilities for multi-view 2D-to-3D projection and triangulation."""
+
+from __future__ import annotations
+
 import copy
 import itertools
+from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
 from aniposelib.cameras import CameraGroup as CameraGroupAnipose
+from jaxtyping import Float
 from kornia.geometry.calibration import distort_points, undistort_points
 from kornia.geometry.camera import PinholeCamera
 from kornia.geometry.epipolar import triangulate_points
-from torchtyping import TensorType
 
 # to ignore imports for sphix-autoapidoc
 __all__ = [
@@ -19,11 +24,11 @@ __all__ = [
 
 
 def project_camera_pairs_to_3d(
-    points: TensorType["batch", "num_views", "num_keypoints", 2],
-    intrinsics: TensorType["batch", "num_views", 3, 3],
-    extrinsics: TensorType["batch", "num_views", 3, 4],
-    dist: TensorType["batch", "num_views", "num_params"],
-) -> TensorType["batch", "cam_pair", "num_keypoints", 3]:
+    points: Float[torch.Tensor, "batch num_views num_keypoints 2"],
+    intrinsics: Float[torch.Tensor, "batch num_views 3 3"],
+    extrinsics: Float[torch.Tensor, "batch num_views 3 4"],
+    dist: Float[torch.Tensor, "batch num_views num_params"],
+) -> Float[torch.Tensor, "batch cam_pair num_keypoints 3"]:
     """Project 2D keypoints from each pair of cameras into 3D world space."""
 
     num_batch, num_views, num_keypoints, _ = points.shape
@@ -83,11 +88,11 @@ def project_camera_pairs_to_3d(
 
 
 def project_3d_to_2d(
-    points_3d: TensorType["batch", "num_keypoints", 3],
-    intrinsics: TensorType["batch", "num_views", 3, 3],
-    extrinsics: TensorType["batch", "num_views", 3, 4],
-    dist: TensorType["batch", "num_views", "num_params"],
-) -> TensorType["batch", "num_views", "num_keypoints", 2]:
+    points_3d: Float[torch.Tensor, "batch num_keypoints 3"],
+    intrinsics: Float[torch.Tensor, "batch num_views 3 3"],
+    extrinsics: Float[torch.Tensor, "batch num_views 3 4"],
+    dist: Float[torch.Tensor, "batch num_views num_params"],
+) -> Float[torch.Tensor, "batch num_views num_keypoints 2"]:
     """Project 3D keypoints to 2D using camera parameters.
 
     Fully vectorized and differentiable implementation.
@@ -173,7 +178,7 @@ def project_3d_to_2d(
 class CameraGroup(CameraGroupAnipose):
     """Inherit Anipose camera group and add new non-jitted triangulation method for dataloaders."""
 
-    def triangulate_fast(self, points, undistort=True):
+    def triangulate_fast(self, points: np.ndarray, undistort: bool = True) -> np.ndarray:
         """Given an CxNx2 array, this returns an Nx3 array of points,
         where N is the number of points and C is the number of cameras"""
 
@@ -194,7 +199,7 @@ class CameraGroup(CameraGroupAnipose):
                 new_points[cnum] = cam.undistort_points(sub)
             points = new_points
 
-        n_cams, n_points, _ = points.shape
+        n_cams, n_points, _ = points.shape  # type: ignore[misc]
 
         cam_Rt_mats = np.array([cam.get_extrinsics_mat()[:3] for cam in self.cameras])
 
@@ -213,18 +218,31 @@ class CameraGroup(CameraGroupAnipose):
 
         return out
 
-    def copy(self):
+    def copy(self) -> CameraGroup:
+        """Return a shallow copy of this CameraGroup with copied cameras and metadata.
+
+        Returns:
+            A new ``CameraGroup`` instance with independent copies of all cameras and metadata.
+        """
         cameras = [cam.copy() for cam in self.cameras]
         metadata = copy.copy(self.metadata)
         return CameraGroup(cameras, metadata)
 
-    def copy_with_new_cameras(self, cameras):
+    def copy_with_new_cameras(self, cameras: list) -> CameraGroup:
         """Create a new CameraGroup with the same properties but different cameras."""
         new_group = copy.deepcopy(self)
         new_group.cameras = cameras
         return new_group
 
     @classmethod
-    def load(cls, path):
-        parent_instance = super().load(path)  # Load using parent class
+    def load(cls, path: str | Path) -> CameraGroup:
+        """Load a CameraGroup from a file.
+
+        Args:
+            path: path to the serialized camera group file.
+
+        Returns:
+            A ``CameraGroup`` instance with the loaded camera parameters.
+        """
+        parent_instance = super().load(path)  # type: ignore[arg-type]  # Load using parent class
         return cls(**vars(parent_instance))  # Return as CameraGroup

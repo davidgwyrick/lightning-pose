@@ -1,16 +1,21 @@
+import copy
 import json
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import torch
 from lightning import LightningModule, Trainer
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 
 from lightning_pose.callbacks import (
+    AnnealWeight,
     JSONInferenceProgressTracker,
     JSONTrainingProgressTracker,
     PatchMasker,
     PatchMasking,
     UnfreezeBackbone,
+    get_callbacks,
 )
 
 
@@ -129,6 +134,79 @@ class TestPatchMasking:
         assert schedule_info["curriculum_progress"] == "0.0%"
         assert schedule_info["steps_to_max_masking"] == 0
         assert schedule_info["steps_to_patch_masking"] == 0
+
+    def test_on_train_batch_start_disabled_does_not_modify_batch(
+        self, patch_masking_disabled,
+    ):
+        """Batch is not modified and current_patch_mask is not set when masking disabled."""
+        trainer = MagicMock()
+        trainer.global_step = 300
+        pl_module = MagicMock()
+        images = torch.ones(2, 2, 3, 64, 64)
+        batch = {'images': images.clone()}
+
+        patch_masking_disabled.on_train_batch_start(trainer, pl_module, batch, batch_idx=0)
+
+        assert torch.equal(batch['images'], images)
+
+    def test_on_train_batch_start_images_key_is_masked(self, patch_masking_enabled):
+        """Batch 'images' tensor is replaced with masked version and patch mask is stored."""
+        trainer = MagicMock()
+        trainer.global_step = 200  # past init_step=100 so masking is active
+        pl_module = MagicMock()
+        images = torch.ones(2, 2, 3, 64, 64)
+        batch = {'images': images.clone()}
+
+        patch_masking_enabled.on_train_batch_start(trainer, pl_module, batch, batch_idx=0)
+
+        assert not torch.equal(batch['images'], images)
+        assert pl_module.current_patch_mask is not None
+
+    def test_on_train_batch_start_frames_key_is_masked(self, patch_masking_enabled):
+        """Batch 'frames' tensor is replaced with masked version when 'images' key absent."""
+        trainer = MagicMock()
+        trainer.global_step = 200
+        pl_module = MagicMock()
+        frames = torch.ones(2, 2, 3, 64, 64)
+        batch = {'frames': frames.clone()}
+
+        patch_masking_enabled.on_train_batch_start(trainer, pl_module, batch, batch_idx=0)
+
+        assert not torch.equal(batch['frames'], frames)
+        assert pl_module.current_patch_mask is not None
+
+    def test_on_train_batch_start_no_valid_key_returns_early(self, patch_masking_enabled):
+        """Batch dict without 'images' or 'frames' key leaves pl_module unchanged."""
+        trainer = MagicMock()
+        trainer.global_step = 200
+        pl_module = MagicMock(spec=[])  # no attributes at all
+        batch = {'labels': torch.ones(2)}
+
+        patch_masking_enabled.on_train_batch_start(trainer, pl_module, batch, batch_idx=0)
+
+        assert not hasattr(pl_module, 'current_patch_mask')
+
+    def test_on_train_epoch_end_disabled_does_not_log(self, patch_masking_disabled):
+        """pl_module.log is not called when masking is disabled."""
+        trainer = MagicMock()
+        trainer.global_step = 300
+        pl_module = MagicMock()
+
+        patch_masking_disabled.on_train_epoch_end(trainer, pl_module)
+
+        pl_module.log.assert_not_called()
+
+    def test_on_train_epoch_end_logs_mask_ratio(self, patch_masking_enabled):
+        """pl_module.log is called with 'patch_mask_ratio' when masking is enabled."""
+        trainer = MagicMock()
+        trainer.global_step = 300
+        pl_module = MagicMock()
+
+        patch_masking_enabled.on_train_epoch_end(trainer, pl_module)
+
+        pl_module.log.assert_called_once()
+        call_args = pl_module.log.call_args
+        assert call_args[0][0] == 'patch_mask_ratio'
 
 
 class TestPatchMasker:
@@ -415,7 +493,7 @@ def progress_filepath(tmp_path) -> Path:
 class BaseTestProgressTracker:
     def _read_progress(self, filepath: Path | str):
         """Helper to read the JSON file content."""
-        with open(filepath, "r") as f:
+        with open(filepath) as f:
             return json.load(f)
 
 
@@ -502,7 +580,7 @@ class TestJSONTrainingProgressTracker:
 
     def _read_progress_train(self, filepath: Path | str):
         """Helper to read the JSON file content and extract progress and status."""
-        with open(filepath, "r") as f:
+        with open(filepath) as f:
             data = json.load(f)
         # Return the progress dict for easier checking, but also check status
         return data["progress"], data["status"]
@@ -566,7 +644,9 @@ class TestJSONTrainingProgressTracker:
     def test_on_train_end_finalizes_progress_epoch_mode(
         self, mock_trainer_epoch, mock_module, progress_filepath
     ):
-        """Test that on_train_end sets completed count equal to total epochs AND sets status to EVALUATING."""
+        """Test that on_train_end sets completed count equal to total epochs AND sets status
+        to EVALUATING.
+        """
         tracker = JSONTrainingProgressTracker(filepath=progress_filepath)
         tracker.on_train_start(mock_trainer_epoch, mock_module)
 
@@ -626,7 +706,9 @@ class TestJSONTrainingProgressTracker:
     def test_on_train_end_finalizes_progress_step_mode(
         self, mock_trainer_step, mock_module, progress_filepath
     ):
-        """Test that on_train_end sets completed count equal to total steps AND sets status to EVALUATING."""
+        """Test that on_train_end sets completed count equal to total steps AND sets status
+        to EVALUATING.
+        """
         tracker = JSONTrainingProgressTracker(filepath=progress_filepath)
         tracker.on_train_start(mock_trainer_step, mock_module)
 
@@ -640,3 +722,84 @@ class TestJSONTrainingProgressTracker:
         assert progress_data["completed"] == 100
         assert progress_data["total"] == 100
         assert status == "EVALUATING"  # 100 == 100
+
+
+class TestGetCallbacks:
+    """Test the get_callbacks function."""
+
+    def test_get_callbacks_default(self, cfg):
+        """Default args produce UnfreezeBackbone, LearningRateMonitor, and ModelCheckpoint."""
+        cfg_tmp = copy.deepcopy(cfg)
+        cfg_tmp.model.losses_to_use = []
+        callbacks = get_callbacks(cfg_tmp)
+        types = [type(cb) for cb in callbacks]
+        assert UnfreezeBackbone in types
+        assert LearningRateMonitor in types
+        assert ModelCheckpoint in types
+
+    def test_get_callbacks_with_early_stopping(self, cfg):
+        """early_stopping=True adds an EarlyStopping callback."""
+        cfg_tmp = copy.deepcopy(cfg)
+        cfg_tmp.model.losses_to_use = []
+        callbacks = get_callbacks(cfg_tmp, early_stopping=True)
+        types = [type(cb) for cb in callbacks]
+        assert EarlyStopping in types
+
+    def test_get_callbacks_without_backbone_unfreeze(self, cfg):
+        """backbone_unfreeze=False omits UnfreezeBackbone."""
+        cfg_tmp = copy.deepcopy(cfg)
+        cfg_tmp.model.losses_to_use = []
+        callbacks = get_callbacks(cfg_tmp, backbone_unfreeze=False)
+        types = [type(cb) for cb in callbacks]
+        assert UnfreezeBackbone not in types
+
+    def test_get_callbacks_without_lr_monitor(self, cfg):
+        """lr_monitor=False omits LearningRateMonitor."""
+        cfg_tmp = copy.deepcopy(cfg)
+        cfg_tmp.model.losses_to_use = []
+        callbacks = get_callbacks(cfg_tmp, lr_monitor=False)
+        types = [type(cb) for cb in callbacks]
+        assert LearningRateMonitor not in types
+
+    def test_get_callbacks_without_checkpointing(self, cfg):
+        """checkpointing=False omits the best-model ModelCheckpoint."""
+        cfg_tmp = copy.deepcopy(cfg)
+        cfg_tmp.model.losses_to_use = []
+        callbacks = get_callbacks(cfg_tmp, checkpointing=False)
+        types = [type(cb) for cb in callbacks]
+        assert ModelCheckpoint not in types
+
+    def test_get_callbacks_with_ckpt_every_n_epochs(self, cfg):
+        """ckpt_every_n_epochs adds a second ModelCheckpoint that fires periodically."""
+        cfg_tmp = copy.deepcopy(cfg)
+        cfg_tmp.model.losses_to_use = []
+        callbacks = get_callbacks(cfg_tmp, ckpt_every_n_epochs=5)
+        ckpt_callbacks = [cb for cb in callbacks if isinstance(cb, ModelCheckpoint)]
+        assert len(ckpt_callbacks) == 2
+
+    def test_get_callbacks_with_unsupervised_losses(self, cfg):
+        """Non-empty losses_to_use adds an AnnealWeight callback."""
+        cfg_tmp = copy.deepcopy(cfg)
+        cfg_tmp.model.losses_to_use = ['temporal']
+        callbacks = get_callbacks(cfg_tmp)
+        types = [type(cb) for cb in callbacks]
+        assert AnnealWeight in types
+
+    def test_get_callbacks_with_status_file(self, cfg, tmp_path):
+        """Passing status_file adds a JSONTrainingProgressTracker callback."""
+        cfg_tmp = copy.deepcopy(cfg)
+        cfg_tmp.model.losses_to_use = []
+        status_file = tmp_path / 'status.json'
+        callbacks = get_callbacks(cfg_tmp, status_file=status_file)
+        types = [type(cb) for cb in callbacks]
+        assert JSONTrainingProgressTracker in types
+
+    def test_get_callbacks_patch_masking(self, cfg):
+        """Patch masking is added for multiview transformer when final_ratio > 0."""
+        cfg_tmp = copy.deepcopy(cfg)
+        cfg_tmp.model.losses_to_use = []
+        cfg_tmp.model.model_type = 'heatmap_multiview_transformer'
+        cfg_tmp.training.patch_mask = {'final_ratio': 0.5}
+        callbacks = get_callbacks(cfg_tmp)
+        types = [type(cb) for cb in callbacks]
+        assert PatchMasking in types

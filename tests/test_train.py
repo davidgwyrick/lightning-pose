@@ -7,7 +7,8 @@ import pytest
 import torch
 from omegaconf import OmegaConf, open_dict
 
-from lightning_pose.train import train
+from lightning_pose.data import get_data_module
+from lightning_pose.train import calculate_steps_per_epoch, train
 
 
 # TODO: Replace with contextlib.chdir in python 3.11.
@@ -31,11 +32,11 @@ def _test_cfg(cfg):
     cfg_tmp.training.min_epochs = 2
     cfg_tmp.training.max_epochs = 2
     cfg_tmp.training.check_val_every_n_epoch = 1
+    cfg_tmp.training.lr_scheduler_params.multisteplr.milestones = [1, 2]
     cfg_tmp.training.log_every_n_steps = 1
     cfg_tmp.training.limit_train_batches = 2
 
     # train simple model
-    cfg_tmp.model.model_type = "heatmap"
     cfg_tmp.model.losses_to_use = []
 
     # predict on vid
@@ -47,6 +48,7 @@ def _test_cfg(cfg):
 
 def test_train_singleview(cfg, tmp_path):
     cfg = _test_cfg(cfg)
+    cfg.model.model_type = "heatmap"
 
     # temporarily change working directory to temp output directory
     with chdir(tmp_path):
@@ -112,7 +114,7 @@ def test_train_singleview_detector_outputs(cfg, tmp_path):
     pose_model_dir.mkdir()
     with chdir(pose_model_dir):
         # train model
-        train(cfg, detector_model)
+        train(cfg, detector_model)  # type: ignore[arg-type]
 
     # ensure labeled data was properly processed
     assert (pose_model_dir / "config.yaml").is_file()
@@ -126,6 +128,8 @@ def test_train_multiview(cfg_multiview, tmp_path):
     from lightning_pose.train import train
 
     cfg = _test_cfg(cfg_multiview)
+    cfg.model.model_type = "heatmap_multiview_transformer"
+    cfg.model.backbone = "vits_dino"
 
     # temporarily change working directory to temp output directory
     with chdir(tmp_path):
@@ -212,3 +216,51 @@ def test_train_multi_gpu_unsupervised(cfg, tmp_path, pytestconfig):
     cfg.model.losses_to_use = ["pca_singleview", "pca_multiview", "temporal"]
 
     _execute_multi_gpu_test(cfg, tmp_path, pytestconfig)
+
+
+class TestCalculateStepsPerEpoch:
+    """Test the calculate_steps_per_epoch function."""
+
+    def test_calculate_steps_per_epoch_supervised(self, cfg, base_dataset):
+        """Test the computation of steps per epoch."""
+        cfg_tmp = copy.deepcopy(cfg)
+        cfg_tmp.model.losses_to_use = []
+
+        # Small number of train frames
+        cfg_tmp.training.train_frames = 3
+        cfg_tmp.training.train_batch_size = 2
+        base_data_module = get_data_module(cfg_tmp, dataset=base_dataset, video_dir=None)
+        n_batches = calculate_steps_per_epoch(base_data_module)
+        assert n_batches == 2
+
+        # Large number of frames
+        cfg_tmp.training.limit_train_batches = None
+        cfg_tmp.training.train_frames = 49
+        cfg_tmp.training.train_batch_size = 2
+        base_data_module = get_data_module(cfg_tmp, dataset=base_dataset, video_dir=None)
+        n_batches = calculate_steps_per_epoch(base_data_module)
+        assert n_batches == 25  # ceil (49 / 2)
+
+    def test_calculate_steps_per_epoch_unsupervised(self, cfg, base_dataset, toy_data_dir):
+        """Test the computation of steps per epoch."""
+        video_dir = os.path.join(toy_data_dir, 'videos')
+        cfg_tmp = copy.deepcopy(cfg)
+
+        # Small number of train frames - return minimum of 10
+        cfg_tmp.training.train_frames = 3
+        cfg_tmp.training.train_batch_size = 2
+        base_data_module_combined = get_data_module(
+            cfg_tmp, dataset=base_dataset, video_dir=video_dir,
+        )
+        n_batches = calculate_steps_per_epoch(base_data_module_combined)
+        assert n_batches == 10
+
+        # Large number of frames
+        cfg_tmp.training.limit_train_batches = None
+        cfg_tmp.training.train_frames = 49
+        cfg_tmp.training.train_batch_size = 2
+        base_data_module_combined = get_data_module(
+            cfg_tmp, dataset=base_dataset, video_dir=video_dir,
+        )
+        n_batches = calculate_steps_per_epoch(base_data_module_combined)
+        assert n_batches == 25  # ceil (49 / 2)

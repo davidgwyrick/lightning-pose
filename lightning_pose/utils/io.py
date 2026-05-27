@@ -7,17 +7,15 @@ import os
 import re
 import warnings
 from pathlib import Path
-from typing import Tuple
+from typing import overload
 
 import numpy as np
 import pandas as pd
 from omegaconf import DictConfig, ListConfig
-from typeguard import typechecked
 
 # to ignore imports for sphix-autoapidoc
 __all__ = [
     "ckpt_path_from_base_path",
-    "check_if_semi_supervised",
     "get_keypoint_names",
     "return_absolute_path",
     "return_absolute_data_paths",
@@ -30,7 +28,6 @@ __all__ = [
 ]
 
 
-@typechecked
 def ckpt_path_from_base_path(
     base_path: str,
     model_name: str,
@@ -109,7 +106,10 @@ def ckpt_path_from_base_path(
         )
     else:
         # No 'best' checkpoint found
-        warnings.warn("No 'best' checkpoint found, falling back to latest checkpoint.")
+        warnings.warn(
+            "No 'best' checkpoint found, falling back to latest checkpoint.",
+            stacklevel=2,
+        )
         if len(latest_version_files) == 1:
             # Only one checkpoint file exists, return it
             return latest_version_files[0]
@@ -132,48 +132,32 @@ def ckpt_path_from_base_path(
             else:
                 # Could not determine which checkpoint to use
                 raise ValueError(
-                    f"Multiple checkpoint files found but cannot determine which to use: {latest_version_files}. "
+                    "Multiple checkpoint files found but cannot determine which "
+                    f"to use: {latest_version_files}. "
                     "None are marked as 'best' and cannot parse step counts to determine latest. "
                     "Please manually select the appropriate checkpoint."
                 )
 
 
-@typechecked
-def check_if_semi_supervised(losses_to_use: ListConfig | list | None = None) -> bool:
-    """Use config file to determine if model is semi-supervised.
-
-    Take the entry of the hydra cfg that specifies losses_to_use. If it contains
-    meaningful entries, infer that we want a semi_supervised model.
-
-    Args:
-        losses_to_use (ListConfig, list | None, optional): the cfg entry
-            specifying semisupervised losses to use. Defaults to None.
-
-    Returns:
-        bool: True if the model is semi_supervised. False otherwise.
-
-    """
-    if losses_to_use is None:  # null
-        semi_supervised = False
-    elif len(losses_to_use) == 0:  # empty list
-        semi_supervised = False
-    elif (
-        len(losses_to_use) == 1 and losses_to_use[0] == ""
-    ):  # list with an empty string
-        semi_supervised = False
-    else:
-        semi_supervised = True
-    return semi_supervised
-
-
-@typechecked
 def get_keypoint_names(
-    cfg: DictConfig | None = None,
+    cfg: DictConfig | ListConfig | None = None,
     csv_file: str | None = None,
     header_rows: list | None = [0, 1, 2],
 ) -> list[str]:
-    if os.path.exists(csv_file):
+    """Return keypoint names from a label CSV file or from the config.
+
+    Args:
+        cfg: hydra config; used as a fallback when ``csv_file`` is not provided or does not exist.
+        csv_file: path to a labeled CSV file in DLC format; takes precedence over ``cfg``.
+        header_rows: row indices in the CSV that form the MultiIndex header. Defaults to
+            ``[0, 1, 2]`` (DLC format with scorer/bodypart/coords rows).
+
+    Returns:
+        List of keypoint name strings.
+    """
+    if csv_file is not None and os.path.exists(csv_file):
         if header_rows is None:
+            assert cfg is not None
             if "header_rows" in cfg.data:
                 header_rows = list(cfg.data.header_rows)
             else:
@@ -191,7 +175,8 @@ def get_keypoint_names(
             # self.keypoint_names = csv_data.columns.levels[1]
             keypoint_names = [b[1] for b in csv_data.columns if b[2] == "x"]
     else:
-        keypoint_names = ["bp_%i" % n for n in range(cfg.data.num_targets // 2)]
+        assert cfg is not None, 'cfg must be provided when csv_file is not given'
+        keypoint_names = [f"bp_{n}" for n in range(cfg.data.num_targets // 2)]
     return keypoint_names
 
 
@@ -200,7 +185,6 @@ def get_keypoint_names(
 # --------------------------------------------------------------------------------------
 
 
-@typechecked
 def return_absolute_path(possibly_relative_path: str, n_dirs_back: int = 3) -> str:
     """Return absolute path from possibly relative path."""
     if os.path.isabs(possibly_relative_path):
@@ -215,14 +199,13 @@ def return_absolute_path(possibly_relative_path: str, n_dirs_back: int = 3) -> s
             desired_path_list = desired_path_list[:-1]
         abs_path = os.path.join(os.path.sep, *desired_path_list, possibly_relative_path)
     if not os.path.exists(abs_path):
-        raise IOError("%s is not a valid path" % abs_path)
+        raise OSError(f"{abs_path} is not a valid path")
     return abs_path
 
 
-@typechecked
 def return_absolute_data_paths(
     data_cfg: DictConfig, n_dirs_back: int = 3
-) -> Tuple[str, str]:
+) -> tuple[str, str]:
     """Generate absolute path for our example toy data.
 
     @hydra.main decorator switches the cwd when executing the decorated function, e.g.,
@@ -247,7 +230,22 @@ def return_absolute_data_paths(
     return data_dir, video_dir
 
 
-@typechecked
+@overload
+def get_videos_in_dir(
+    video_dir: str,
+    view_names: None = None,
+    return_mp4_only: bool = True,
+) -> list[str]: ...
+
+
+@overload
+def get_videos_in_dir(
+    video_dir: str,
+    view_names: list[str],
+    return_mp4_only: bool = True,
+) -> list[list[str]]: ...
+
+
 def get_videos_in_dir(
     video_dir: str, view_names: list[str] | None = None, return_mp4_only: bool = True
 ) -> list[str] | list[list[str]]:
@@ -294,16 +292,46 @@ def get_videos_in_dir(
         ]
 
     if len(video_files) == 0:
-        raise IOError("Did not find any valid video files in %s" % video_dir)
+        raise OSError(f"Did not find any valid video files in {video_dir}")
 
     return video_files
 
 
-@typechecked
+@overload
+def check_video_paths(
+    video_paths: list[str] | str,
+    view_names: None = None,
+) -> list[str]: ...
+
+
+@overload
+def check_video_paths(
+    video_paths: list[str] | str,
+    view_names: list[str],
+) -> list[list[str]]: ...
+
+
 def check_video_paths(
     video_paths: list[str] | str,
     view_names: list[str] | None = None,
 ) -> list[str] | list[list[str]]:
+    """Validate and normalise video paths, returning a flat or nested list of mp4 paths.
+
+    Accepts a single file path, a list of file paths, or a directory and returns a flat list of
+    video paths for single-view models, or a nested list ``(views × sessions)`` for multi-view
+    models.
+
+    Args:
+        video_paths: single video file path, list of video file paths, or a directory.
+        view_names: if provided, organise the paths by view name for a multi-view model.
+
+    Returns:
+        For single-view: ``list[str]`` of mp4 file paths.
+        For multi-view: ``list[list[str]]`` where outer list indexes views.
+
+    Raises:
+        ValueError: if ``video_paths`` is not a valid file, list, or directory.
+    """
     # get input data
     if isinstance(video_paths, list):
         # presumably a list of files
@@ -357,7 +385,6 @@ def collect_video_files_by_view(
     return video_files_by_view
 
 
-@typechecked
 def get_context_img_paths(center_img_path: Path) -> list[Path]:
     """Given the path to a center image frame, return paths of 5 context frames
     (n-2, n-1, n, n+1, n+2).
@@ -406,7 +433,10 @@ def fix_empty_first_row(df: pd.DataFrame) -> pd.DataFrame:
     if df.index.name is not None:
         new_row = {col: np.nan for col in df.columns}
         prepend_df = pd.DataFrame(
-            new_row, index=[df.index.name], columns=df.columns, dtype="float64"
+            new_row,
+            index=pd.Index([df.index.name]),
+            columns=df.columns,
+            dtype="float64",
         )
         fixed_df = pd.concat([prepend_df, df])
         assert fixed_df.index.name is None
@@ -457,15 +487,17 @@ def split_video_files_by_view(
     view_names: list[str],
 ) -> list[list[Path]]:
     """
-    For a list of videos from different sessions and views, split them up and return a list of lists
-    like `[[session0_view0.mp4, session0_view1.mp4, ...], [session1_view0.mp4, session1_view1.mp4, ...], ...]`
+    For a list of videos from different sessions and views, split them up and return a list of
+    lists like
+    `[[sess0_view0.mp4, sess0_view1.mp4, ...], [sess1_view0.mp4, sess1_view1.mp4, ...], ...]`
 
     Args:
         video_paths: List of paths to video files to split
         view_names: List of view names to find videos for
 
     Returns:
-        List for each session, each containing a sub-list with videos for each view for that session
+        List for each session, each containing a sub-list with videos for each view for
+        that session
     """
     # map of session -> view -> video
     session_view_video_map = collections.defaultdict(dict[str, Path])
@@ -495,15 +527,17 @@ def find_video_files_for_views(
     video_dir: str, view_names: list[str]
 ) -> list[list[Path]]:
     """
-    Search inside a folder to find a list of videos from different sessions and views, split them up and return a list of lists
-    like `[[session0_view0.mp4, session0_view1.mp4, ...], [session1_view0.mp4, session1_view1.mp4, ...], ...]`
+    Search inside a folder to find a list of videos from different sessions and views, split them
+    up and return a list of lists like
+    `[[sess0_view0.mp4, sess0_view1.mp4, ...], [sess1_view0.mp4, sess1_view1.mp4, ...], ...]`
 
     Args:
         video_dir: Directory containing video files
         view_names: List of view names to find videos for
 
     Returns:
-        List for each session, each containing a sub-list with videos for each view for that session
+        List for each session, each containing a sub-list with videos for each view for
+        that session
     """
     video_dir_path = Path(video_dir)
 

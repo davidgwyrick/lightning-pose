@@ -1,5 +1,8 @@
+"""Tools for cropping labeled frames and videos to bounding-box regions of interest."""
+
 import multiprocessing
 from pathlib import Path
+from typing import Any
 
 import cv2
 import numpy as np
@@ -8,7 +11,6 @@ import tqdm
 from moviepy import VideoFileClip
 from omegaconf import DictConfig
 from PIL import Image
-from typeguard import typechecked
 
 from lightning_pose.utils import io
 
@@ -19,7 +21,6 @@ __all__ = [
 ]
 
 
-@typechecked
 def _calculate_bbox_size(keypoints_per_frame: np.ndarray, crop_ratio: float = 1.0) -> np.ndarray:
     """Computes bounding box size for each frame.
 
@@ -54,10 +55,47 @@ def _calculate_bbox_size(keypoints_per_frame: np.ndarray, crop_ratio: float = 1.
     return bbox_sizes
 
 
-@typechecked
 def _compute_bbox_df(
-    pred_df: pd.DataFrame, anchor_keypoints: list[str], crop_ratio: float = 1.0
+    pred_df: pd.DataFrame,
+    anchor_keypoints: list[str],
+    crop_ratio: float | None = None,
+    crop_height: int | None = None,
+    crop_width: int | None = None,
 ) -> pd.DataFrame:
+    """Compute a bounding-box DataFrame from predicted keypoint positions.
+
+    Each row corresponds to one frame and contains the top-left corner (x, y) and size (h, w)
+    of a square bounding box. Exactly one of ``crop_ratio`` or the pair
+    ``(crop_height, crop_width)`` must be provided.
+
+    When ``crop_ratio`` is used, the box is centred on the per-frame mean of the anchor
+    keypoints and sized by scaling the keypoint span by ``crop_ratio``.
+
+    When ``crop_height``/``crop_width`` are used, the box is a fixed size centred on the
+    per-frame mean of the anchor keypoints.
+
+    Args:
+        pred_df: DataFrame of predictions with a MultiIndex column of ``(scorer, bodypart, coord)``
+            or equivalent; must contain x and y coordinate columns.
+        anchor_keypoints: list of keypoint names used to determine the bounding box centre and
+            size; pass an empty list to use all keypoints.
+        crop_ratio: scale factor applied to the keypoint span to determine bbox size.
+        crop_height: fixed bbox height in pixels; must be provided together with ``crop_width``.
+        crop_width: fixed bbox width in pixels; must be provided together with ``crop_height``.
+
+    Returns:
+        DataFrame with columns ``["x", "y", "h", "w"]`` and the same index as ``pred_df``.
+
+    Raises:
+        ValueError: if both ``crop_ratio`` and ``crop_height``/``crop_width`` are provided, or
+            if neither is provided.
+    """
+    fixed_size_mode = crop_height is not None and crop_width is not None
+    if fixed_size_mode and crop_ratio is not None:
+        raise ValueError('provide either crop_ratio or (crop_height, crop_width), not both.')
+    if not fixed_size_mode and crop_ratio is None:
+        raise ValueError('one of crop_ratio or (crop_height, crop_width) must be provided.')
+
     # Get x,y columns for anchor_keypoints (or all keypoints if anchor_keypoints is empty)
     coord_mask = pred_df.columns.get_level_values("coords").isin(["x", "y"])
     if len(anchor_keypoints) > 0:
@@ -74,15 +112,20 @@ def _compute_bbox_df(
     # Shape: (frames, keypoints, x|y)
     keypoints_per_frame = pred_df.loc[:, coord_mask].to_numpy().reshape(pred_df.shape[0], -1, 2)
 
-    bbox_sizes = _calculate_bbox_size(keypoints_per_frame, crop_ratio=crop_ratio)
+    if fixed_size_mode:
+        assert crop_height is not None and crop_width is not None
+        # round up to even dimensions for video-player compatibility
+        crop_height += crop_height % 2
+        crop_width += crop_width % 2
+        bbox_sizes = np.tile([crop_height, crop_width], (len(pred_df), 1))
+        centroids = keypoints_per_frame.mean(axis=1)
+    else:
+        assert crop_ratio is not None
+        bbox_sizes = _calculate_bbox_size(keypoints_per_frame, crop_ratio=crop_ratio)
+        centroids = keypoints_per_frame.mean(axis=1)
 
-    # Shape: (frames, keypoints, x|y) -> (frames, x|y)
-    centroids = keypoints_per_frame.mean(axis=1)
-
-    # Instead of storing centroid, we'll store bbox top-left.
     # Shape: (frames, x|y)
     bbox_toplefts = centroids - bbox_sizes // 2
-    # Floor and store ints.
     bbox_toplefts = np.int64(bbox_toplefts)
 
     # Shape: (frames, x|y) -> (frames, x|y|h|w)
@@ -90,10 +133,10 @@ def _compute_bbox_df(
 
     index = pred_df.index
 
-    return pd.DataFrame(bboxes, index=index, columns=["x", "y", "h", "w"])
+    return pd.DataFrame(bboxes, index=pd.Index(index), columns=pd.Index(["x", "y", "h", "w"]))
 
 
-def _crop_image(img_path, bbox, cropped_img_path):
+def _crop_image(img_path: Path, bbox: tuple[int, int, int, int], cropped_img_path: Path) -> None:
     """
     Crops an image to the specified bounding box and saves the cropped image.
 
@@ -113,11 +156,18 @@ def _crop_image(img_path, bbox, cropped_img_path):
     img.save(cropped_img_path)
 
 
-def _star_crop_image(args):
+def _star_crop_image(args: tuple) -> None:
+    """Unpack a tuple of arguments and call ``_crop_image``.
+
+    This wrapper is used with multiprocessing ``Pool.map`` which requires a single-argument
+    callable.
+
+    Args:
+        args: tuple of ``(img_path, bbox, cropped_img_path)`` forwarded to ``_crop_image``.
+    """
     return _crop_image(*args)
 
 
-@typechecked
 def _crop_images(bbox_df: pd.DataFrame, root_directory: Path, output_directory: Path) -> None:
     """
     Crops a directory of images based on bounding box data provided in a DataFrame and stores
@@ -125,25 +175,28 @@ def _crop_images(bbox_df: pd.DataFrame, root_directory: Path, output_directory: 
     in the directory.
 
     Args:
-        bbox_df (pd.DataFrame): DataFrame containing bounding box information for cropping. The DataFrame
-            is expected to have an index representing image paths, and include columns `x`, `y`, `w`, and
-            `h` representing bounding box coordinates and dimensions.
-        root_directory (Path): Path to the directory containing the original images to be processed.
+        bbox_df (pd.DataFrame): DataFrame containing bounding box information for cropping. The
+            DataFrame is expected to have an index representing image paths, and include columns
+            `x`, `y`, `w`, and `h` representing bounding box coordinates and dimensions.
+        root_directory (Path): Path to the directory containing the original images to be
+            processed.
         output_directory (Path): Path to the directory where cropped images will be saved.
 
     Raises:
-        ValueError: Raised if invalid data is encountered in the bounding box DataFrame or if paths are
-            improperly specified.
+        ValueError: Raised if invalid data is encountered in the bounding box DataFrame or if paths
+            are improperly specified.
 
     Note:
-        - Multiprocessing is utilized for scaling the cropping operations across multiple CPU cores.
-        - User must ensure the validity and compatibility of paths and bounding box data prior to
-          execution.
+        - Multiprocessing is utilized for scaling the cropping operations across multiple
+            CPU cores.
+        - User must ensure the validity and compatibility of paths and bounding box data prior
+            to execution.
     """
 
     _file_cache: dict[Path, bool] = {}
 
-    def _file_exists(path):
+    def _file_exists(path: Path) -> bool:
+        """Return True if ``root_directory / path`` exists, with results cached."""
         # Cache path.exists() as an easy way to speed up.
         # TODO: This is still slow. Get all files in the dir and check if file is in the list.
         if path in _file_cache:
@@ -159,7 +212,7 @@ def _crop_images(bbox_df: pd.DataFrame, root_directory: Path, output_directory: 
         bbox_df.iterrows(), total=len(bbox_df), desc="Building crop tasks"
     ):
         # TODO Add unit tests for this logic.
-        center_img_path = Path(center_img_path)
+        center_img_path = Path(str(center_img_path))
         for img_path in io.get_context_img_paths(center_img_path):
             # If context frame:
             if img_path != center_img_path:
@@ -187,8 +240,7 @@ def _crop_images(bbox_df: pd.DataFrame, root_directory: Path, output_directory: 
             pass
 
 
-@typechecked
-def _crop_video_moviepy(video_file: Path, bbox_df: pd.DataFrame, output_file: Path):
+def _crop_video_moviepy(video_file: Path, bbox_df: pd.DataFrame, output_file: Path) -> None:
     """
     Crops a video using bounding box dimensions specified in a DataFrame and saves the
     output to a given file path.
@@ -215,7 +267,8 @@ def _crop_video_moviepy(video_file: Path, bbox_df: pd.DataFrame, output_file: Pa
     h = round(h / 2) * 2
     w = round(w / 2) * 2
 
-    def crop_frame(get_frame, t):
+    def crop_frame(get_frame: Any, t: float) -> np.ndarray:
+        """Crop a single video frame at time ``t`` to the bounding box for that frame."""
         frame = get_frame(t)
 
         frame_index = int(t * clip.fps)  # Calculate frame index based on time
@@ -252,7 +305,6 @@ def _crop_video_moviepy(video_file: Path, bbox_df: pd.DataFrame, output_file: Pa
     cropped_clip.write_videofile(str(output_file), codec="libx264")
 
 
-@typechecked
 def generate_cropped_labeled_frames(
     input_data_dir: Path,
     input_csv_file: Path,
@@ -271,7 +323,11 @@ def generate_cropped_labeled_frames(
 
     # compute and save bbox_df
     bbox_df = _compute_bbox_df(
-        pred_df, list(detector_cfg.anchor_keypoints), crop_ratio=detector_cfg.crop_ratio
+        pred_df,
+        list(detector_cfg.anchor_keypoints),
+        crop_ratio=detector_cfg.get('crop_ratio'),
+        crop_height=detector_cfg.get('crop_height'),
+        crop_width=detector_cfg.get('crop_width'),
     )
 
     output_bbox_file.parent.mkdir(parents=True, exist_ok=True)
@@ -286,7 +342,6 @@ def generate_cropped_labeled_frames(
     )
 
 
-@typechecked
 def generate_cropped_video(
     input_video_file: Path,
     input_preds_file: Path,
@@ -302,7 +357,11 @@ def generate_cropped_video(
 
     # Save cropping bboxes
     bbox_df = _compute_bbox_df(
-        pred_df, list(detector_cfg.anchor_keypoints), crop_ratio=detector_cfg.crop_ratio
+        pred_df,
+        list(detector_cfg.anchor_keypoints),
+        crop_ratio=detector_cfg.get('crop_ratio'),
+        crop_height=detector_cfg.get('crop_height'),
+        crop_width=detector_cfg.get('crop_width'),
     )
     output_bbox_file.parent.mkdir(parents=True, exist_ok=True)
     bbox_df.to_csv(output_bbox_file)
@@ -316,7 +375,7 @@ def generate_cropped_csv_file(
     input_bbox_file: str | Path,
     output_csv_file: str | Path,
     mode: str = "subtract",
-):
+) -> None:
     """
     Adjusts coordinates in the input CSV file either by adding or subtracting
     corresponding values from a bounding box CSV file. The resulting data is saved

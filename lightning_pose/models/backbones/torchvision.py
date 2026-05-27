@@ -1,23 +1,24 @@
+"""Backbone loader for torchvision ResNet and EfficientNet architectures."""
+
 from collections import OrderedDict
-from typing import Tuple
+from typing import Any
 
 import torch
 import torchvision.models as tvmodels
-from typeguard import typechecked
 
+from lightning_pose.models import ALLOWED_MODEL_TYPES
 from lightning_pose.models.backbones import ALLOWED_BACKBONES
 
 # to ignore imports for sphix-autoapidoc
 __all__ = []
 
 
-@typechecked
 def build_backbone(
     backbone_arch: ALLOWED_BACKBONES,
     pretrained: bool = True,
-    model_type: str = "heatmap",
-    **kwargs,
-) -> Tuple:
+    model_type: ALLOWED_MODEL_TYPES = 'heatmap',
+    **kwargs: Any,
+) -> tuple[torch.nn.Module, int]:
     """Load backbone weights for resnets, efficientnets, and other models from torchvision.
 
     Args:
@@ -32,22 +33,8 @@ def build_backbone(
 
     """
 
-    if backbone_arch == "resnet50_contrastive":
-        # load resnet50 pretrained using SimCLR on imagenet
-        try:
-            from pl_bolts.models.self_supervised import SimCLR
-        except ImportError:
-            raise Exception(
-                "lightning-bolts package is not installed.\n"
-                "Run `pip install lightning-bolts` "
-                "in order to access 'resnet50_contrastive' backbone"
-            )
-        ckpt_url = "https://pl-bolts-weights.s3.us-east-2.amazonaws.com/simclr/bolts_simclr_imagenet/simclr_imagenet.ckpt"  # noqa: E501
-        simclr = SimCLR.load_from_checkpoint(ckpt_url, strict=False)
-        base = simclr.encoder
-
-    elif "resnet50_animal" in backbone_arch:
-        base = getattr(tvmodels, "resnet50")(weights=None)
+    if "resnet50_animal" in backbone_arch:
+        base = tvmodels.resnet50(weights=None)
         backbone_type = "_".join(backbone_arch.split("_")[2:])
         if backbone_type == "apose":
             ckpt_url = "https://download.openmmlab.com/mmpose/animal/resnet/res50_animalpose_256x256-e1f30bff_20210426.pth"  # noqa: E501
@@ -63,7 +50,7 @@ def build_backbone(
         base.load_state_dict(new_state_dict, strict=False)
 
     elif "resnet50_human" in backbone_arch:
-        base = getattr(tvmodels, "resnet50")(weights=None)
+        base = tvmodels.resnet50(weights=None)
         backbone_type = "_".join(backbone_arch.split("_")[2:])
         if backbone_type == "jhmdb":
             ckpt_url = "https://download.openmmlab.com/mmpose/top_down/resnet/res50_jhmdb_sub3_256x256-c4ec1a0b_20201122.pth"  # noqa: E501
@@ -125,15 +112,14 @@ def build_backbone(
     if "resnet" in backbone_arch:
         num_fc_input_features = base.fc.in_features
     elif "eff" in backbone_arch:
-        num_fc_input_features = base.classifier[-1].in_features
+        num_fc_input_features = base.classifier[-1].in_features  # type: ignore[index,attr-defined]
     else:
         raise NotImplementedError
 
     return backbone, num_fc_input_features
 
 
-@typechecked
-def grab_layers_sequential(model, last_layer_ind: int) -> torch.nn.Sequential:
+def grab_layers_sequential(model: torch.nn.Module, last_layer_ind: int) -> torch.nn.Sequential:
     """Package selected number of layers into a torch.nn.Sequential object.
 
     Args:

@@ -1,9 +1,16 @@
+"""Migration to rename colon-separated time directories to hyphen-separated ones.
+
+Addresses https://github.com/paninski-lab/lightning-pose/issues/278, where output directories
+used HH:MM:SS format (e.g., ``outputs/2024-01-01/12:00:00``) which is invalid on Windows
+and causes issues with some tools. This migration renames them to HH-MM-SS format.
+"""
+
 import os
 import re
 from pathlib import Path
 
 
-def needs_migration():
+def needs_migration() -> bool | None:
     """Checks if the time directory rename migration is needed."""
     outputs_path = Path("outputs")
     if not outputs_path.is_dir():
@@ -16,7 +23,7 @@ def needs_migration():
     return False
 
 
-def migrate():
+def migrate() -> bool:
     """Renames time directories."""
     print(
         "Fixing directory names (https://github.com/paninski-lab/lightning-pose/issues/278)..."

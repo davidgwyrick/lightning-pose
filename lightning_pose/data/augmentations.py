@@ -4,7 +4,6 @@ from typing import Any
 
 import imgaug.augmenters as iaa
 from omegaconf import DictConfig, ListConfig
-from typeguard import typechecked
 
 # to ignore imports for sphix-autoapidoc
 __all__ = [
@@ -12,7 +11,6 @@ __all__ = [
 ]
 
 
-@typechecked
 def imgaug_transform(params_dict: dict | DictConfig) -> iaa.Sequential:
     """Create simple and flexible data transform pipeline that augments images and keypoints.
 
@@ -77,7 +75,7 @@ def imgaug_transform(params_dict: dict | DictConfig) -> iaa.Sequential:
     data_transform = []
 
     for transform_str, args in params_dict.items():
-        transform = getattr(iaa, transform_str)
+        transform = getattr(iaa, str(transform_str))
         apply_prob = args.get("p", 0.5)
         transform_args = args.get("args", ())
         transform_kwargs = args.get("kwargs", {})
@@ -111,6 +109,19 @@ def imgaug_transform(params_dict: dict | DictConfig) -> iaa.Sequential:
 
 
 def expand_imgaug_str_to_dict(params: str) -> dict[str, Any]:
+    """Expand a shorthand augmentation string to a full parameter dictionary.
+
+    Args:
+        params: augmentation preset string. One of ``"default"``, ``"none"``, ``"dlc"``,
+            ``"dlc-lr"``, ``"dlc-top-down"``, or ``"dlc-mv"``.
+
+    Returns:
+        Dictionary mapping augmentation transform names to their parameter dicts, suitable
+        for passing to :func:`imgaug_transform`.
+
+    Raises:
+        NotImplementedError: if ``params`` is not one of the allowed preset strings.
+    """
 
     _allowed_imgaug_strs = [
         "default",

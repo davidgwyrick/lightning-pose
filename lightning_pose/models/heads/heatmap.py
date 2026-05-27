@@ -1,13 +1,12 @@
 """Heads that produce heatmap predictions for heatmap regression."""
 
-from typing import Tuple
 
 import torch
+from jaxtyping import Float
 from kornia.filters import filter2d
 from kornia.geometry.subpix import spatial_expectation2d, spatial_softmax2d
 from kornia.geometry.transform.pyramid import _get_pyramid_gaussian_kernel
 from torch import nn
-from torchtyping import TensorType
 
 from lightning_pose.data.utils import evaluate_heatmaps_at_location
 
@@ -21,6 +20,18 @@ def make_upsampling_layers(
     int_channels: int,
     n_layers: int,
 ) -> torch.nn.Sequential:
+    """Build a sequential upsampling head composed of a PixelShuffle and ConvTranspose2d layers.
+
+    Args:
+        in_channels: number of input feature-map channels.
+        out_channels: number of output channels (i.e. number of keypoints).
+        int_channels: number of channels in each intermediate convolutional layer.
+        n_layers: total number of ConvTranspose2d layers after the PixelShuffle.
+
+    Returns:
+        ``nn.Sequential`` starting with a ``PixelShuffle(2)`` followed by ``n_layers``
+        ConvTranspose2d layers.
+    """
     # Note:
     # https://github.com/jgraving/DeepPoseKit/blob/
     # cecdb0c8c364ea049a3b705275ae71a2f366d4da/deepposekit/models/DeepLabCut.py#L131
@@ -57,21 +68,21 @@ def make_upsampling_layers(
     return nn.Sequential(*upsampling_layers)
 
 
-def initialize_upsampling_layers(layers) -> None:
+def initialize_upsampling_layers(layers: nn.Sequential) -> None:
     """Intialize the Conv2DTranspose upsampling layers."""
     for index, layer in enumerate(layers):
         if index > 0:  # we ignore the PixelShuffle
             if isinstance(layer, nn.ConvTranspose2d):
                 torch.nn.init.xavier_uniform_(layer.weight, gain=0.01)
-                torch.nn.init.zeros_(layer.bias)
+                torch.nn.init.zeros_(layer.bias)  # type: ignore[arg-type]
             elif isinstance(layer, nn.BatchNorm2d):
                 torch.nn.init.constant_(layer.weight, 1.0)
                 torch.nn.init.constant_(layer.bias, 0.0)
 
 
 def upsample(
-    inputs: TensorType["batch", "num_keypoints", "heatmap_height", "heatmap_width"],
-) -> TensorType["batch", "num_keypoints", "two_x_heatmap_height", "two_x_heatmap_width"]:
+    inputs: Float[torch.Tensor, "batch num_keypoints heatmap_height heatmap_width"],
+) -> Float[torch.Tensor, "batch num_keypoints two_x_heatmap_height two_x_heatmap_width"]:
     """Upsample batch of heatmaps by a factor of two using interpolation (no learned weights).
 
     This is a copy of kornia's pyrup function but with better defaults.
@@ -87,10 +98,10 @@ def upsample(
 
 
 def run_subpixelmaxima(
-    heatmaps: TensorType["batch", "num_keypoints", "heatmap_height", "heatmap_width"],
+    heatmaps: Float[torch.Tensor, "batch num_keypoints heatmap_height heatmap_width"],
     downsample_factor: int,
-    temperature: torch.tensor,
-) -> Tuple[TensorType["batch", "num_targets"], TensorType["batch", "num_keypoints"]]:
+    temperature: torch.Tensor,
+) -> tuple[Float[torch.Tensor, "batch num_targets"], Float[torch.Tensor, "batch num_keypoints"]]:
     """Use soft argmax on heatmaps.
 
     Args:
@@ -147,7 +158,7 @@ class HeatmapHead(nn.Module):
         deconv_out_channels: int | None = None,
         downsample_factor: int = 2,
         final_softmax: bool = True,
-    ):
+    ) -> None:
         """
 
         Args:
@@ -186,8 +197,8 @@ class HeatmapHead(nn.Module):
 
     def forward(
         self,
-        features: TensorType["batch", "features", "features_height", "features_width"],
-    ) -> TensorType["batch", "num_keypoints", "heatmap_height", "heatmap_width"]:
+        features: Float[torch.Tensor, "batch features features_height features_width"],
+    ) -> Float[torch.Tensor, "batch num_keypoints heatmap_height heatmap_width"]:
         """Upsample representations and normalize to get final heatmaps."""
         heatmaps = self.upsampling_layers(features)
         if self.final_softmax:
@@ -195,5 +206,17 @@ class HeatmapHead(nn.Module):
             heatmaps = spatial_softmax2d(heatmaps, temperature=torch.tensor([1.0]))
         return heatmaps
 
-    def run_subpixelmaxima(self, heatmaps):
+    def run_subpixelmaxima(
+        self,
+        heatmaps: Float[torch.Tensor, "batch num_keypoints height width"],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply soft argmax to heatmaps to obtain subpixel keypoint predictions.
+
+        Args:
+            heatmaps: predicted heatmaps of shape ``(batch, num_keypoints, height, width)``.
+
+        Returns:
+            Tuple of ``(keypoints, confidences)`` where keypoints has shape
+            ``(batch, num_targets)`` and confidences has shape ``(batch, num_keypoints)``.
+        """
         return run_subpixelmaxima(heatmaps, self.downsample_factor, self.temperature)

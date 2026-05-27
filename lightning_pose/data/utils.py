@@ -1,25 +1,21 @@
 """Dataset/data module utilities."""
-import os
-from typing import Any, Literal, Tuple, Union
+from __future__ import annotations
 
-import imgaug.augmenters as iaa
-import lightning.pytorch as pl
+import os
+
 import numpy as np
 import torch
-from torchtyping import TensorType
-from typeguard import typechecked
+from jaxtyping import Float
 
 from lightning_pose.data.datatypes import (
     HeatmapLabeledBatchDict,
     MultiviewHeatmapLabeledBatchDict,
     MultiviewUnlabeledBatchDict,
-    SemiSupervisedDataLoaderDict,
     UnlabeledBatchDict,
 )
 
 # to ignore imports for sphix-autoapidoc
 __all__ = [
-    "DataExtractor",
     "split_sizes_from_probabilities",
     "clean_any_nans",
     "count_frames",
@@ -35,184 +31,6 @@ __all__ = [
 ]
 
 
-class DataExtractor(object):
-    """Helper class to extract all data from a data module."""
-
-    def __init__(
-        self,
-        data_module: pl.LightningDataModule,
-        cond: Literal["train", "test", "val"] = "train",
-        extract_images: bool = False,
-        remove_augmentations: bool = True,
-    ) -> None:
-        self.cond = cond
-        self.extract_images = extract_images
-        self.remove_augmentations = remove_augmentations
-
-        if self.remove_augmentations:
-            imgaug_curr = data_module.dataset.imgaug_transform
-            if len(imgaug_curr) == 1 and isinstance(imgaug_curr[0], iaa.Resize):
-                # current augmentation just resizes; keep this
-                self.data_module = data_module
-            else:
-                from lightning_pose.data.datamodules import (
-                    BaseDataModule,
-                    UnlabeledDataModule,
-                )
-                from lightning_pose.data.datasets import (
-                    BaseTrackingDataset,
-                    HeatmapDataset,
-                    MultiviewHeatmapDataset,
-                )
-
-                # Create a simple resize-only augmentation pipeline for PCA
-                # Use the same resize dimensions as the original dataset
-                dataset_old = data_module.dataset
-                image_resize_height = dataset_old.image_resize_height
-                image_resize_width = dataset_old.image_resize_width
-                imgaug_new = iaa.Sequential([
-                    iaa.Resize({"height": image_resize_height, "width": image_resize_width})
-                ])
-
-                if isinstance(data_module.dataset, HeatmapDataset):
-                    dataset_new = HeatmapDataset(
-                        root_directory=dataset_old.root_directory,
-                        csv_path=dataset_old.csv_path,
-                        image_resize_height=dataset_old.image_resize_height,
-                        image_resize_width=dataset_old.image_resize_width,
-                        imgaug_transform=imgaug_new,
-                        downsample_factor=dataset_old.downsample_factor,
-                        do_context=dataset_old.do_context,
-                    )
-                elif isinstance(dataset_old, BaseTrackingDataset):
-                    dataset_new = BaseTrackingDataset(
-                        root_directory=dataset_old.root_directory,
-                        csv_path=dataset_old.csv_path,
-                        image_resize_height=dataset_old.image_resize_height,
-                        image_resize_width=dataset_old.image_resize_width,
-                        imgaug_transform=imgaug_new,
-                        do_context=dataset_old.do_context,
-                    )
-                elif isinstance(dataset_old, MultiviewHeatmapDataset):
-                    dataset_new = MultiviewHeatmapDataset(
-                        root_directory=dataset_old.root_directory,
-                        csv_paths=dataset_old.csv_paths,
-                        view_names=dataset_old.view_names,
-                        image_resize_height=dataset_old.image_resize_height,
-                        image_resize_width=dataset_old.image_resize_width,
-                        imgaug_transform=imgaug_new,
-                        do_context=dataset_old.do_context,
-                    )
-                else:
-                    raise NotImplementedError
-                # rebuild data_module with new dataset
-                if isinstance(data_module, UnlabeledDataModule):
-                    data_module_new = UnlabeledDataModule(
-                        dataset=dataset_new,
-                        video_paths_list=data_module.video_paths_list,
-                        train_batch_size=data_module.train_batch_size,
-                        val_batch_size=data_module.val_batch_size,
-                        test_batch_size=data_module.test_batch_size,
-                        num_workers=data_module.num_workers,
-                        train_probability=data_module.train_probability,
-                        val_probability=data_module.val_probability,
-                        train_frames=data_module.train_frames,
-                        dali_config=data_module.dali_config,
-                        torch_seed=data_module.torch_seed,
-                    )
-                    # data_module_new.setup() happens internally
-                elif isinstance(data_module, BaseDataModule):
-                    data_module_new = BaseDataModule(
-                        dataset=dataset_new,
-                        train_batch_size=data_module.train_batch_size,
-                        val_batch_size=data_module.val_batch_size,
-                        test_batch_size=data_module.test_batch_size,
-                        num_workers=data_module.num_workers,
-                        train_probability=data_module.train_probability,
-                        val_probability=data_module.val_probability,
-                        train_frames=data_module.train_frames,
-                        torch_seed=data_module.torch_seed,
-                    )
-                else:
-                    raise NotImplementedError
-
-                self.data_module = data_module_new
-
-        else:
-            self.data_module = data_module
-
-    @property
-    def dataset_length(self) -> int:
-        name = "%s_dataset" % self.cond
-        return len(getattr(self.data_module, name))
-
-    def get_loader(
-        self,
-    ) -> torch.utils.data.DataLoader | SemiSupervisedDataLoaderDict:
-        if self.cond == "train":
-            return self.data_module.train_dataloader()
-        if self.cond == "val":
-            return self.data_module.val_dataloader()
-        if self.cond == "test":
-            return self.data_module.test_dataloader()
-
-    @staticmethod
-    def verify_labeled_loader(
-        loader: torch.utils.data.DataLoader | SemiSupervisedDataLoaderDict
-    ) -> torch.utils.data.DataLoader:
-        if isinstance(loader, torch.utils.data.DataLoader):
-            labeled_loader = loader
-        else:
-            # if we have a dictionary of dataloaders, we take the loader called
-            # "labeled" (the loader called "unlabeled" doesn't have keypoints)
-            labeled_loader = loader.iterables["labeled"]
-        return labeled_loader
-
-    def iterate_over_dataloader(
-        self, loader: torch.utils.data.DataLoader
-    ) -> Tuple[
-        TensorType["num_examples", Any],
-        Union[
-            TensorType["num_examples", 3, "image_width", "image_height"],
-            TensorType["num_examples", "frames", 3, "image_width", "image_height"],
-            None,
-        ],
-    ]:
-        keypoints_list = []
-        images_list = []
-        for ind, batch in enumerate(loader):
-            keypoints_list.append(batch["keypoints"])
-            if self.extract_images:
-                images_list.append(batch["images"])
-        concat_keypoints = torch.cat(keypoints_list, dim=0)
-        if self.extract_images:
-            concat_images = torch.cat(images_list, dim=0)
-        else:
-            concat_images = None
-        # assert that indeed the number of columns does not change after concatenation,
-        # and that the number of rows is the dataset length.
-        assert concat_keypoints.shape == (
-            self.dataset_length,
-            keypoints_list[0].shape[1],
-        )
-        return concat_keypoints, concat_images
-
-    def __call__(
-        self,
-    ) -> Tuple[
-        TensorType["num_examples", Any],
-        Union[
-            TensorType["num_examples", 3, "image_width", "image_height"],
-            TensorType["num_examples", "frames", 3, "image_width", "image_height"],
-            None,
-        ],
-    ]:
-        loader = self.get_loader()
-        loader = self.verify_labeled_loader(loader)
-        return self.iterate_over_dataloader(loader)
-
-
-@typechecked
 def split_sizes_from_probabilities(
     total_number: int,
     train_probability: float,
@@ -239,9 +57,11 @@ def split_sizes_from_probabilities(
         val_probability = round(remaining_probability / 2, 5)
         test_probability = round(remaining_probability / 2, 5)
     elif test_probability is None:
+        assert val_probability is not None
         test_probability = 1.0 - train_probability - val_probability
 
     # probabilities should add to one
+    assert val_probability is not None
     assert test_probability + train_probability + val_probability == 1.0
 
     # compute numbers from probabilities
@@ -270,7 +90,6 @@ def split_sizes_from_probabilities(
     return [train_number, val_number, test_number]
 
 
-@typechecked
 def clean_any_nans(data: torch.Tensor, dim: int) -> torch.Tensor:
     """Remove samples from a data array that contain nans."""
     # currently supports only 2D arrays
@@ -281,9 +100,9 @@ def clean_any_nans(data: torch.Tensor, dim: int) -> torch.Tensor:
         return data[:, ~nan_bool]
     elif dim == 1:
         return data[~nan_bool]
+    raise ValueError(f"dim must be 0 or 1, got {dim}")
 
 
-@typechecked
 def count_frames(video_file: str) -> int:
     """
     Simple function to count the number of frames in a video.
@@ -299,7 +118,6 @@ def count_frames(video_file: str) -> int:
     return num_frames
 
 
-@typechecked
 def compute_num_train_frames(
     len_train_dataset: int,
     train_frames: int | float | None = None,
@@ -338,16 +156,15 @@ def compute_num_train_frames(
     return n_train_frames
 
 
-# @typechecked
 def generate_heatmaps(
-    keypoints: TensorType["batch", "num_keypoints", 2],
+    keypoints: Float[torch.Tensor, "batch num_keypoints 2"],
     height: int,
     width: int,
-    output_shape: Tuple[int, int],
+    output_shape: tuple[int, int],
     sigma: float = 1.25,
     uniform_heatmaps: bool = False,
     keep_gradients: bool = False,
-) -> TensorType["batch", "num_keypoints", "height", "width"]:
+) -> Float[torch.Tensor, "batch num_keypoints height width"]:
     """Generate 2D Gaussian heatmaps from mean and sigma.
 
     Args:
@@ -419,13 +236,12 @@ def generate_heatmaps(
     return heatmaps
 
 
-# @typechecked
 def evaluate_heatmaps_at_location(
-    heatmaps: TensorType["batch", "num_keypoints", "heatmap_height", "heatmap_width"],
-    locs: TensorType["batch", "num_keypoints", 2],
+    heatmaps: Float[torch.Tensor, "batch num_keypoints heatmap_height heatmap_width"],
+    locs: Float[torch.Tensor, "batch num_keypoints 2"],
     sigma: float = 1.25,  # sigma used for generating heatmaps
     num_stds: int = 2,  # num standard deviations of pixels to compute confidence
-) -> TensorType["batch", "num_keypoints"]:
+) -> Float[torch.Tensor, "batch num_keypoints"]:
     """Evaluate 4D heatmaps using a 3D location tensor (last dim is x, y coords). Since
     the model outputs heatmaps with a standard deviation of sigma, confidence will be
     spread across neighboring pixels. To account for this, confidence is computed by
@@ -453,9 +269,9 @@ def evaluate_heatmaps_at_location(
     offsets = list(np.arange(-pix_to_consider, pix_to_consider + 1))
     vals_all = []
     for offset in offsets:
-        k_offset = k + offset
+        k_offset = k + int(offset)
         for offset_2 in offsets:
-            m_offset = m + offset_2
+            m_offset = m + int(offset_2)
             # get rid of singleton dims
             vals = heatmaps_padded[i, j, k_offset, m_offset].squeeze(-1).squeeze(-1)
             vals_all.append(vals)
@@ -463,11 +279,10 @@ def evaluate_heatmaps_at_location(
     return vals
 
 
-# @typechecked
 def undo_affine_transform(
-    keypoints: TensorType["seq_len", "num_keypoints", 2],
-    transform: TensorType["seq_len", 2, 3] | TensorType[2, 3],
-) -> TensorType["seq_len", "num_keypoints", 2]:
+    keypoints: Float[torch.Tensor, "seq_len num_keypoints 2"],
+    transform: Float[torch.Tensor, "seq_len 2 3"] | Float[torch.Tensor, "2 3"],
+) -> Float[torch.Tensor, "seq_len num_keypoints 2"]:
     """Undo an affine transform given a tensor of keypoints and the tranform matrix."""
 
     # add 1s to get keypoints in projective geometry coords
@@ -477,7 +292,7 @@ def undo_affine_transform(
         device=keypoints.device,
         requires_grad=True,
     )
-    kps_aff = torch.concat([keypoints, ones], axis=2)
+    kps_aff = torch.cat([keypoints, ones], dim=2)
 
     mat = torch.clone(transform).detach()
     if len(transform.shape) == 2:
@@ -492,12 +307,9 @@ def undo_affine_transform(
             [mat_inv_, torch.matmul(-mat_inv_, mat[idx, :, -1, None])], dim=1
         )
         mats_inv_torch.append(
-            torch.tensor(
-                torch.transpose(mat_inv, 1, 0),
-                dtype=keypoints.dtype,
-                device=keypoints.device,
-                requires_grad=True,
-            )
+            torch.transpose(mat_inv, 1, 0).detach().clone().to(
+                dtype=keypoints.dtype, device=keypoints.device,
+            ).requires_grad_(True)
         )
 
     # make a single block of inverse matrices
@@ -517,17 +329,17 @@ def undo_affine_transform(
 
 
 def undo_affine_transform_batch(
-    keypoints_augmented: TensorType["seq_len", "num_keypointsx2"],
-    transforms: Union[
-        TensorType["seq_len", "h":2, "w":3],
-        TensorType["h":2, "w":3],
-        TensorType["seq_len", "null":1],
-        TensorType["null":1],
-        TensorType["num_views", "h":2, "w":3],
-        TensorType["num_views", "null":1, "null":1],
-    ],
+    keypoints_augmented: Float[torch.Tensor, "seq_len num_keypointsx2"],
+    transforms: (
+        Float[torch.Tensor, "seq_len h w"]
+        | Float[torch.Tensor, "h w"]
+        | Float[torch.Tensor, "seq_len 1"]
+        | Float[torch.Tensor, 1]
+        | Float[torch.Tensor, "num_views h w"]
+        | Float[torch.Tensor, "num_views 1 1"]
+    ),
     is_multiview: bool = False,
-) -> TensorType["seq_len", "num_keypointsx2"]:
+) -> Float[torch.Tensor, "seq_len num_keypointsx2"]:
     """Potentially undo an affine transform given a tensor of keypoints and the tranform matrix."""
 
     # undo augmentation if needed
@@ -563,9 +375,9 @@ def undo_affine_transform_batch(
 
 
 def normalized_to_bbox(
-    keypoints: TensorType["batch", "num_keypoints", "xy":2],
-    bbox: TensorType["batch", "xyhw":4]
-) -> TensorType["batch", "num_keypoints", "xy":2]:
+    keypoints: Float[torch.Tensor, "batch num_keypoints xy"],
+    bbox: Float[torch.Tensor, "batch xyhw"]
+) -> Float[torch.Tensor, "batch num_keypoints xy"]:
     """Transform keypoints from normalized coordinates to bbox coordinates"""
     if keypoints.shape[0] == bbox.shape[0]:
         # normal batch
@@ -589,9 +401,9 @@ def convert_bbox_coords(
         | MultiviewUnlabeledBatchDict
         | UnlabeledBatchDict
     ),
-    predicted_keypoints: TensorType["batch", "num_targets"],
+    predicted_keypoints: Float[torch.Tensor, "batch num_targets"],
     in_place: bool = True,
-) -> TensorType["batch", "num_targets"]:
+) -> Float[torch.Tensor, "batch num_targets"]:
     """Transform keypoints from bbox coordinates to absolute frame coordinates."""
     num_targets = predicted_keypoints.shape[1]
     num_keypoints = num_targets // 2
@@ -602,20 +414,22 @@ def convert_bbox_coords(
         predicted_keypoints_ = predicted_keypoints.clone().reshape((-1, num_keypoints, 2))
     # divide by image dims to get 0-1 normalized coordinates
     if "images" in batch_dict.keys():
-        predicted_keypoints_[:, :, 0] /= batch_dict["images"].shape[-1]  # -1 dim is width "x"
-        predicted_keypoints_[:, :, 1] /= batch_dict["images"].shape[-2]  # -2 dim is height "y"
+        img = batch_dict["images"]  # type: ignore[typeddict-item]
+        predicted_keypoints_[:, :, 0] /= img.shape[-1]  # -1 dim is width "x"
+        predicted_keypoints_[:, :, 1] /= img.shape[-2]  # -2 dim is height "y"
     else:  # we have unlabeled dict, 'frames' instead of 'images'
-        predicted_keypoints_[:, :, 0] /= batch_dict["frames"].shape[-1]  # -1 dim is width "x"
-        predicted_keypoints_[:, :, 1] /= batch_dict["frames"].shape[-2]  # -2 dim is height "y"
+        frames = batch_dict["frames"]  # type: ignore[typeddict-item]
+        predicted_keypoints_[:, :, 0] /= frames.shape[-1]  # -1 dim is width "x"
+        predicted_keypoints_[:, :, 1] /= frames.shape[-2]  # -2 dim is height "y"
     # multiply and add by bbox dims (x,y,h,w)
     if (
-        ("num_views" in batch_dict.keys() and int(batch_dict["num_views"].max()) > 1)
+        ("num_views" in batch_dict.keys() and int(batch_dict["num_views"].max()) > 1)  # type: ignore[typeddict-item]
         or batch_dict.get("is_multiview", False)
     ):
         # the first check is for labeled batches while is_multiview is for unlabeled batches
         # For MultiviewUnlabeledBatchDict, we need to infer num_views from bbox shape
         if "num_views" in batch_dict.keys():
-            unique = batch_dict["num_views"].unique()
+            unique = batch_dict["num_views"].unique()  # type: ignore[typeddict-item]
             if len(unique) != 1:
                 raise ValueError(
                     f"each batch element must contain the same number of views; "
@@ -645,8 +459,8 @@ def convert_bbox_coords(
 
 def convert_original_to_model_coords(
     batch_dict: MultiviewHeatmapLabeledBatchDict,
-    original_keypoints: TensorType["batch", "num_views", "num_keypoints", 2],
-) -> TensorType["batch", "num_views", "num_keypoints", 2]:
+    original_keypoints: Float[torch.Tensor, "batch num_views num_keypoints 2"],
+) -> Float[torch.Tensor, "batch num_views num_keypoints 2"]:
     """Transform keypoints from original frame coordinates to model input coordinates."""
 
     batch_size, num_views, num_keypoints, _ = original_keypoints.shape
@@ -673,11 +487,11 @@ def convert_original_to_model_coords(
 
 
 def original_to_model(
-    keypoints: TensorType["batch", "num_keypoints", 2],
-    bbox: TensorType["batch", 4],
+    keypoints: Float[torch.Tensor, "batch num_keypoints 2"],
+    bbox: Float[torch.Tensor, "batch 4"],
     model_width: float,
     model_height: float,
-) -> TensorType["batch", "num_keypoints", 2]:
+) -> Float[torch.Tensor, "batch num_keypoints 2"]:
     """Convert keypoints from original image coordinates to model input coordinates.
 
     This combines the transformations:

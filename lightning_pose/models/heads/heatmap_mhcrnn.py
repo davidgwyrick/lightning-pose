@@ -1,12 +1,12 @@
 """Heads that produce heatmap predictions for heatmap regression."""
 
-from typing import Tuple
+
+from typing import Literal
 
 import torch
+from jaxtyping import Float
 from kornia.geometry.subpix import spatial_softmax2d
 from torch import nn
-from torchtyping import TensorType
-from typing_extensions import Literal
 
 from lightning_pose.models.heads import HeatmapHead
 from lightning_pose.models.heads.heatmap import run_subpixelmaxima
@@ -35,8 +35,8 @@ class HeatmapMHCRNNHead(nn.Module):
         out_channels: int,
         deconv_out_channels: int | None = None,
         downsample_factor: int = 2,
-        upsampling_factor: int = 2,
-    ):
+        upsampling_factor: Literal[1, 2] = 2,
+    ) -> None:
         """
 
         Args:
@@ -78,12 +78,12 @@ class HeatmapMHCRNNHead(nn.Module):
 
     def forward(
         self,
-        features: TensorType["batch", "features", "rep_height", "rep_width", "frames"],
-        batch_shape: torch.tensor,
+        features: Float[torch.Tensor, "batch features rep_height rep_width frames"],
+        batch_shape: torch.Tensor,
         is_multiview: bool,
-    ) -> Tuple[
-        TensorType["batch", "num_keypoints", "heatmap_height", "heatmap_width"],
-        TensorType["batch", "num_keypoints", "heatmap_height", "heatmap_width"],
+    ) -> tuple[
+        Float[torch.Tensor, "batch num_keypoints heatmap_height heatmap_width"],
+        Float[torch.Tensor, "batch num_keypoints heatmap_height heatmap_width"],
     ]:
         """Handle context frames then upsample to get final heatmaps.
 
@@ -94,14 +94,14 @@ class HeatmapMHCRNNHead(nn.Module):
 
         """
 
-        num_frames = batch_shape[0]
+        num_frames = int(batch_shape[0])
 
         if len(batch_shape) == 5 and is_multiview:
             # put view info back in batch so we can properly extract heatmaps
             shape_r = features.shape
             num_frames -= 4  # we lose the first/last 2 frames of unlabeled batch due to context
             features = features.reshape(
-                num_frames * batch_shape[1], -1, shape_r[-3], shape_r[-2], shape_r[-1],
+                num_frames * int(batch_shape[1]), -1, shape_r[-3], shape_r[-2], shape_r[-1],
             )
 
         # permute to shape (frames, batch, features, rep_height, rep_width)
@@ -120,7 +120,19 @@ class HeatmapMHCRNNHead(nn.Module):
 
         return heatmaps_sf, heatmaps_mf
 
-    def run_subpixelmaxima(self, heatmaps):
+    def run_subpixelmaxima(
+        self,
+        heatmaps: Float[torch.Tensor, "batch num_keypoints height width"],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply soft argmax to heatmaps to obtain subpixel keypoint predictions.
+
+        Args:
+            heatmaps: predicted heatmaps of shape ``(batch, num_keypoints, height, width)``.
+
+        Returns:
+            Tuple of ``(keypoints, confidences)`` where keypoints has shape
+            ``(batch, num_targets)`` and confidences has shape ``(batch, num_keypoints)``.
+        """
         return run_subpixelmaxima(heatmaps, self.downsample_factor, self.temperature)
 
 
@@ -236,37 +248,47 @@ class UpsamplingCRNN(nn.Module):
         else:
             self.layers = torch.nn.ModuleList([self.W_f, self.H_f, self.W_b, self.H_b])
 
-    def _initialize_layers(self):
+    def _initialize_layers(self) -> None:
+        """Initialize all convolutional layer weights using Xavier uniform initialization."""
         if self.upsampling_factor == 2:
             torch.nn.init.xavier_uniform_(self.W_pre.weight, gain=1.0)
-            torch.nn.init.zeros_(self.W_pre.bias)
+            torch.nn.init.zeros_(self.W_pre.bias)  # type: ignore[arg-type]
 
         torch.nn.init.xavier_uniform_(self.W_f.weight, gain=1.0)
-        torch.nn.init.zeros_(self.W_f.bias)
-        for index, layer in enumerate(self.H_f):
-            torch.nn.init.xavier_uniform_(layer.weight, gain=1.0)
-            torch.nn.init.zeros_(layer.bias)
+        torch.nn.init.zeros_(self.W_f.bias)  # type: ignore[arg-type]
+        for _index, layer in enumerate(self.H_f):
+            torch.nn.init.xavier_uniform_(layer.weight, gain=1.0)  # type: ignore[arg-type]
+            torch.nn.init.zeros_(layer.bias)  # type: ignore[arg-type]
 
         torch.nn.init.xavier_uniform_(self.W_b.weight, gain=1.0)
-        torch.nn.init.zeros_(self.W_b.bias)
-        for index, layer in enumerate(self.H_b):
-            torch.nn.init.xavier_uniform_(layer.weight, gain=1.0)
-            torch.nn.init.zeros_(layer.bias)
+        torch.nn.init.zeros_(self.W_b.bias)  # type: ignore[arg-type]
+        for _index, layer in enumerate(self.H_b):
+            torch.nn.init.xavier_uniform_(layer.weight, gain=1.0)  # type: ignore[arg-type]
+            torch.nn.init.zeros_(layer.bias)  # type: ignore[arg-type]
 
     def forward(
         self,
-        features: TensorType["frames", "batch", "features", "rep_height", "rep_width"]
-    ) -> TensorType["batch", "num_keypoints", "heatmap_height", "heatmap_width"]:
+        features: Float[torch.Tensor, "frames batch features rep_height rep_width"]
+    ) -> Float[torch.Tensor, "batch num_keypoints heatmap_height heatmap_width"]:
+        """Run the bidirectional CRNN forward pass to produce normalized heatmaps.
 
+        Args:
+            features: context-frame feature maps of shape
+                ``(frames, batch, n_features, rep_height, rep_width)``.
+
+        Returns:
+            Normalized heatmaps of shape ``(batch, num_keypoints, heatmap_height, heatmap_width)``
+            averaged over the forward and backward RNN passes.
+        """
         # expand representations in spatial domain using pixel shuffle to create heatmaps
         if self.upsampling_factor == 2:
             # upsample once more before passing through RNN
             # need to reshape to push through convolution layers
             frames, batch, n_features, rep_height, rep_width = features.shape
             frames_batch_shape = batch * frames
-            representations_batch_frames: TensorType[
-                "batch*frames", "features", "rep_height", "rep_width"
-            ] = features.reshape(frames_batch_shape, n_features, rep_height, rep_width)
+            representations_batch_frames = features.reshape(
+                frames_batch_shape, n_features, rep_height, rep_width,
+            )
             x_tensor = self.W_pre(self.pixel_shuffle(representations_batch_frames))
             x_tensor = x_tensor.reshape(
                 frames,

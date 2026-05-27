@@ -1,11 +1,10 @@
 """Models that produce (x, y) coordinates of keypoints from images."""
 
-from typing import Any, Tuple
+from typing import Any
 
 import torch
-from omegaconf import DictConfig
-from torchtyping import TensorType
-from typeguard import typechecked
+from jaxtyping import Float
+from omegaconf import DictConfig, ListConfig
 
 from lightning_pose.data.datatypes import BaseLabeledBatchDict, UnlabeledBatchDict
 from lightning_pose.data.utils import undo_affine_transform
@@ -30,9 +29,9 @@ class RegressionTracker(BaseSupervisedTracker):
         pretrained: bool = True,
         torch_seed: int = 123,
         optimizer: str = "Adam",
-        optimizer_params: DictConfig | dict | None = None,
+        optimizer_params: DictConfig | ListConfig | dict | None = None,
         lr_scheduler: str = "multisteplr",
-        lr_scheduler_params: DictConfig | dict | None = None,
+        lr_scheduler_params: DictConfig | ListConfig | dict | None = None,
         **kwargs: Any,
     ) -> None:
         """Base model that produces (x, y) coordinates of keypoints from images.
@@ -88,8 +87,8 @@ class RegressionTracker(BaseSupervisedTracker):
 
     def forward(
         self,
-        images: TensorType["batch", "channels":3, "image_height", "image_width"]
-    ) -> TensorType["batch", "two_x_num_keypoints"]:
+        images: Float[torch.Tensor, "batch channels image_height image_width"]
+    ) -> Float[torch.Tensor, "batch two_x_num_keypoints"]:
         """Forward pass through the network."""
         # see input lines for shape of "images"
         representations = self.get_representations(images)
@@ -111,7 +110,7 @@ class RegressionTracker(BaseSupervisedTracker):
         batch_dict: BaseLabeledBatchDict | UnlabeledBatchDict,
         batch_idx: int,
         **kwargs: Any,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Predict keypoints for a batch of video frames.
 
         Assuming a DALI video loader is passed in
@@ -121,17 +120,23 @@ class RegressionTracker(BaseSupervisedTracker):
         """
         if "images" in batch_dict.keys():  # can't do isinstance(o, c) on TypedDicts
             # labeled image dataloaders
-            images = batch_dict["images"]
+            images = batch_dict["images"]  # type: ignore[typeddict-item]
         else:
             # unlabeled dali video dataloaders
-            images = batch_dict["frames"]
+            images = batch_dict["frames"]  # type: ignore[typeddict-item]
         # images -> keypoints
         predicted_keypoints = self.forward(images)
         # regression model does not include a notion of confidence, set to all zeros
         confidence = torch.zeros((predicted_keypoints.shape[0], predicted_keypoints.shape[1] // 2))
         return predicted_keypoints, confidence
 
-    def get_parameters(self):
+    def get_parameters(self) -> list[dict]:
+        """Return per-parameter-group optimizer configuration for backbone and head.
+
+        Returns:
+            List of dicts with ``"params"``, ``"name"``, and optionally ``"lr"`` keys; the
+            backbone starts with learning rate 0 (frozen until unfreezing).
+        """
         params = [
             {"params": self.backbone.parameters(), "lr": 0, "name": "backbone"},
             {"params": self.head.parameters(), "name": "head"},
@@ -139,7 +144,6 @@ class RegressionTracker(BaseSupervisedTracker):
         return params
 
 
-@typechecked
 class SemiSupervisedRegressionTracker(SemiSupervisedTrackerMixin, RegressionTracker):
     """Model produces vectors of keypoints from labeled/unlabeled images."""
 
@@ -152,9 +156,9 @@ class SemiSupervisedRegressionTracker(SemiSupervisedTrackerMixin, RegressionTrac
         pretrained: bool = True,
         torch_seed: int = 123,
         optimizer: str = "Adam",
-        optimizer_params: DictConfig | dict | None = None,
+        optimizer_params: DictConfig | ListConfig | dict | None = None,
         lr_scheduler: str = "multisteplr",
-        lr_scheduler_params: DictConfig | dict | None = None,
+        lr_scheduler_params: DictConfig | ListConfig | dict | None = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -187,6 +191,7 @@ class SemiSupervisedRegressionTracker(SemiSupervisedTrackerMixin, RegressionTrac
             **kwargs,
         )
         self.loss_factory_unsup = loss_factory_unsupervised
+        assert loss_factory_unsupervised is not None
         loss_names = loss_factory_unsupervised.loss_instance_dict.keys()
         if "unimodal_mse" in loss_names or "unimodal_wasserstein" in loss_names:
             raise ValueError("cannot use unimodal loss in regression tracker")

@@ -96,14 +96,16 @@ def test_prepare_dali_single_view(cfg, video_list):
     num_iters = vid_pred_class.num_iters
 
     # always sequence length should be fixed.
-    for i, batch in enumerate(loader):
+    batch_idx = -1
+    for _, batch in enumerate(loader):
         assert batch["frames"].shape == (
             cfg.dali.base.predict.sequence_length,
             3,  # channels
             im_height,
             im_width,
         )
-    assert i == num_iters - 1  # we have the right number of batches drawn
+        batch_idx += 1
+    assert batch_idx == num_iters - 1  # we have the right number of batches drawn
 
     # -----------------------
     # context model
@@ -121,14 +123,16 @@ def test_prepare_dali_single_view(cfg, video_list):
 
     # this one assumes we have only two images in the last batch
     # NOTE: this is a specific property of this video and the context!
-    for i, batch in enumerate(loader):
+    batch_idx = -1
+    for _i, batch in enumerate(loader):
         assert batch["frames"].shape == (
             cfg.dali.context.predict.sequence_length,
             3,  # channels
             im_height,
             im_width,
         )
-    assert i == num_iters - 1
+        batch_idx += 1
+    assert batch_idx == num_iters - 1
 
     # error is thrown if one of the video files does not exist
     with pytest.raises(FileNotFoundError):
@@ -167,7 +171,7 @@ def test_prepare_dali_multiview(cfg_multiview, video_list):
     for train_stage in ["train", "predict"]:
 
         vid_pred_class = PrepareDALI(
-            train_stage=train_stage,
+            train_stage=train_stage,  # type: ignore[arg-type]
             model_type="base",
             filenames=filenames,
             dali_config=cfg_multiview.dali,
@@ -199,7 +203,7 @@ def test_prepare_dali_multiview(cfg_multiview, video_list):
     for train_stage in ["train", "predict"]:
 
         vid_pred_class = PrepareDALI(
-            train_stage=train_stage,
+            train_stage=train_stage,  # type: ignore[arg-type]
             model_type="context",
             filenames=filenames,
             dali_config=cfg_multiview.dali,
